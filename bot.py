@@ -21,8 +21,8 @@ from access  import (generate_key, activate_key, check_access,
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_СЮДА")
-ADMIN_ID  = int(os.getenv("ADMIN_ID", "ВСТАВЬ_СВОЙ_ID_СЮДА"))
+BOT_TOKEN = os.getenv("7673817846:AAEispuEvUQ7yt4pPYZCLkcM2xCbpWj7zWU", "7673817846:AAEispuEvUQ7yt4pPYZCLkcM2xCbpWj7zWU")
+ADMIN_ID  = int(os.getenv("6406599387", "6406599387"))
 
 
 def esc(t):
