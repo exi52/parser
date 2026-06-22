@@ -128,6 +128,7 @@ def kb_main(is_admin=False):
             [InlineKeyboardButton("🗝 Все ключи",       callback_data="admin_keys")],
             [InlineKeyboardButton("👥 Рефералы",        callback_data="admin_refs")],
             [InlineKeyboardButton("📦 Bulk по файлу",   callback_data="bulk_info")],
+            [InlineKeyboardButton("🛒 Купить Bulk",     callback_data="bulk_buy")],
             [InlineKeyboardButton("🔗 Моя реф-ссылка", callback_data="myref")],
             [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
             [InlineKeyboardButton("🆘 Поддержка",       url=f"https://t.me/{SUPPORT_USER}")],
@@ -137,6 +138,7 @@ def kb_main(is_admin=False):
         [InlineKeyboardButton("👥 Мои рефералы",     callback_data="my_referrals")],
         [InlineKeyboardButton("💳 Купить подписку",  callback_data="buy")],
         [InlineKeyboardButton("📦 Bulk по файлу",    callback_data="bulk_info")],
+        [InlineKeyboardButton("🛒 Купить Bulk",      callback_data="bulk_buy")],
         [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
         [InlineKeyboardButton("🆘 Поддержка",        url=f"https://t.me/{SUPPORT_USER}")],
     ])
