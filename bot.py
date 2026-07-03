@@ -140,7 +140,7 @@ def kb_main(is_admin=False):
         [InlineKeyboardButton("💳 Купить подписку",  callback_data="buy")],
         [InlineKeyboardButton("📦 Bulk по файлу",    callback_data="bulk_info")],
         [InlineKeyboardButton("🛒 Купить Bulk",      callback_data="bulk_buy")],
-        [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
+        [InlineKeyboardButton(text='<tg-emoji emoji-id="5062159634589027240">📊</tg-emoji> Статистика', callback_data="stats")],
         [InlineKeyboardButton("🆘 Поддержка",        url=f"https://t.me/{SUPPORT_USER}")],
     ])
 
