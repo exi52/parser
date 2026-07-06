@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bulk Console</title>
+  <link rel="stylesheet" href="/assets/styles.css" onerror="this.onerror=null;this.href='styles.css'">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main class="app">
+    <header class="shellHeader">
+      <div class="brand">
+        <span class="brandMark">OS</span>
+        <div>
+          <h1>Bulk Console</h1>
+          <p id="accountLine">Loading account...</p>
+        </div>
+      </div>
+      <div class="headerActions">
+        <button id="refreshBtn" class="iconButton" type="button" aria-label="Refresh" title="Refresh">
+          <span aria-hidden="true">↻</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="summaryGrid" aria-label="Account and job summary">
+      <div class="metric">
+        <span>Bulk credits</span>
+        <strong id="creditsMetric">-</strong>
+      </div>
+      <div class="metric">
+        <span>Processed</span>
+        <strong id="processedMetric">-</strong>
+      </div>
+      <div class="metric">
+        <span>Found</span>
+        <strong id="foundMetric">-</strong>
+      </div>
+      <div class="metric">
+        <span>Status</span>
+        <strong id="statusMetric">Idle</strong>
+      </div>
+    </section>
+
+    <section class="uploadPanel">
+      <form id="uploadForm" class="dropzone">
+        <input id="fileInput" name="file" type="file" accept=".txt,.csv" required>
+        <div class="dropIcon" aria-hidden="true">↑</div>
+        <div>
+          <h2 id="fileLabel">Drop TXT or CSV</h2>
+          <p id="uploadStatus">TXT / CSV</p>
+        </div>
+        <button type="submit">Start Bulk</button>
+      </form>
+    </section>
+
+    <section class="workspace">
+      <aside class="jobsPane" aria-label="Bulk jobs">
+        <div class="paneHead">
+          <div>
+            <h2>Runs</h2>
+            <p id="jobsCount">No jobs</p>
+          </div>
+        </div>
+        <div id="jobsList" class="jobsList"></div>
+      </aside>
+
+      <section class="resultsPane" aria-label="Bulk results">
+        <div class="paneHead resultsHead">
+          <div>
+            <h2 id="jobTitle">Select a run</h2>
+            <p id="jobMeta">Waiting</p>
+          </div>
+          <a id="exportLink" class="button ghost disabled" href="#">Export CSV</a>
+        </div>
+
+        <div class="progressTrack" aria-label="Progress">
+          <div id="progressBar" class="progressBar"></div>
+        </div>
+
+        <div class="toolbar">
+          <label class="switch">
+            <input id="onlyFound" type="checkbox">
+            <span></span>
+            Found only
+          </label>
+          <select id="sortSelect" aria-label="Sort results">
+            <option value="">Default</option>
+            <option value="balance_desc">Highest balance</option>
+          </select>
+          <input id="searchInput" type="search" placeholder="Search username or wallet">
+          <div class="pager">
+            <button id="prevPage" class="iconButton" type="button" aria-label="Previous page" title="Previous page">‹</button>
+            <button id="nextPage" class="iconButton" type="button" aria-label="Next page" title="Next page">›</button>
+          </div>
+        </div>
+
+        <div id="itemsBody" class="resultList">
+          <div class="emptyState">No run selected</div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script src="/assets/app.js" onerror="this.onerror=null;this.src='app.js'"></script>
+</body>
+</html>
