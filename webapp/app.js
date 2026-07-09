@@ -33,6 +33,7 @@ const els = {
   jobTitle: document.getElementById("jobTitle"),
   jobMeta: document.getElementById("jobMeta"),
   exportLink: document.getElementById("exportLink"),
+  tableExportLink: document.getElementById("tableExportLink"),
   progressBar: document.getElementById("progressBar"),
   onlyFound: document.getElementById("onlyFound"),
   sortSelect: document.getElementById("sortSelect"),
@@ -189,8 +190,11 @@ function renderJob(job) {
   els.jobTitle.textContent = `Run #${job.id}`;
   els.jobMeta.textContent = `${compact(job.processed_count)} of ${compact(job.total_count)} checked · ${compact(job.found_count)} found · ${pct}%`;
   els.progressBar.style.width = `${pct}%`;
-  els.exportLink.href = `/api/jobs/${job.id}/export.csv${initData ? `?tg=${encodeURIComponent(initData)}` : ""}`;
+  const exportUrl = `/api/jobs/${job.id}/export.csv${initData ? `?tg=${encodeURIComponent(initData)}` : ""}`;
+  els.exportLink.href = exportUrl;
   els.exportLink.classList.remove("disabled");
+  els.tableExportLink.href = exportUrl;
+  els.tableExportLink.classList.remove("disabled");
   updateMetrics(job);
 }
 

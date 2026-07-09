@@ -43,6 +43,8 @@ SOLANA_SOL_PRICE_ID = os.getenv(
 _BALANCE_CACHE: dict[str, tuple[float, dict]] = {}
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
+_PLATFORM_HIT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+PLATFORM_HIT_CACHE_SECONDS = int(os.getenv("PLATFORM_HIT_CACHE_SECONDS", "3600"))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -84,6 +86,10 @@ def extract_username(raw: str) -> Optional[str]:
 
 def is_eth_address(s: str) -> bool:
     return bool(re.match(r"^0x[a-fA-F0-9]{40}$", s.strip()))
+
+
+def is_solana_address(s: str) -> bool:
+    return bool(re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", s.strip()))
 
 
 def get_variants(username: str) -> dict:
@@ -178,13 +184,16 @@ async def check_sns(client, username, variants):
                 f"https://sns-sdk-proxy.bonfida.workers.dev/resolve/{domain}",
                 timeout=10)
             if r.status_code == 200:
-                addr = r.json().get("result")
-                if addr:
+                payload = r.json()
+                addr = payload.get("result")
+                if addr and is_solana_address(addr):
                     return {"found": True, "platform": "Solana NS (.sol)", "emoji": "🟣",
                             "url": f"https://naming.bonfida.org/#/domain/{domain}", "matched": name,
                             "wallets": [addr], "extra": {"домен": name}}
+                if addr:
+                    log.debug("sns returned non-address result name=%s result=%s", name, addr)
         except Exception:
-            pass
+            log.debug("sns check failed name=%s", name, exc_info=True)
     return {"found": False, "platform": "Solana NS (.sol)", "emoji": "🟣"}
 
 
@@ -726,7 +735,7 @@ async def check_sui_names(client, username, variants):
 # ─── Список всех платформ (после всех функций) ───────────────────────────────
 
 async def check_ens(client, username, variants):
-    """ENS lookup with Web3.bio fallback when the public The Graph endpoint is rate-limited."""
+    """ENS lookup with multiple free fallbacks for unstable public endpoints."""
     eth_names = [d for d in variants["domains"] if d.endswith(".eth")]
     for name in eth_names[:3]:
         try:
@@ -748,6 +757,17 @@ async def check_ens(client, username, variants):
                 log.debug("ens graph temporary failure name=%s status=%s", name, r.status_code)
         except Exception:
             log.debug("ens graph check failed name=%s", name, exc_info=True)
+
+        try:
+            r = await client.get(f"https://api.ensideas.com/ens/resolve/{name}", timeout=8)
+            if r.status_code == 200:
+                wallet = r.json().get("address")
+                if wallet and is_real_wallet(wallet):
+                    return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
+                            "url": f"https://app.ens.domains/{name}", "matched": name,
+                            "wallets": [wallet], "extra": {"domain": name, "source": "ensideas"}}
+        except Exception:
+            log.debug("ensideas fallback failed name=%s", name, exc_info=True)
 
         try:
             r = await client.get(
@@ -822,11 +842,52 @@ def _get_cached(username: str) -> dict | None:
 def _set_cached(username: str, data: dict):
     if SEARCH_CACHE_SECONDS <= 0:
         return
-    _SEARCH_CACHE[_cache_key(username)] = (time.time(), copy.deepcopy(data))
+    key = _cache_key(username)
+    existing = _SEARCH_CACHE.get(key)
+    if existing:
+        _, old_data = existing
+        data = _merge_search_data(old_data, data)
+    _SEARCH_CACHE[key] = (time.time(), copy.deepcopy(data))
     if len(_SEARCH_CACHE) > 512:
         oldest = sorted(_SEARCH_CACHE.items(), key=lambda item: item[1][0])[:128]
         for key, _ in oldest:
             _SEARCH_CACHE.pop(key, None)
+
+
+def _result_identity(result: dict) -> tuple[str, str]:
+    return (
+        str(result.get("platform") or "").lower(),
+        str(result.get("matched") or "").lower(),
+    )
+
+
+def _merge_search_data(old_data: dict, new_data: dict) -> dict:
+    merged = copy.deepcopy(new_data)
+    results = list(merged.get("results") or [])
+    seen = {_result_identity(r) for r in results if r.get("found")}
+    new_wallets = set(merged.get("all_wallets") or [])
+
+    for old_result in old_data.get("results") or []:
+        if not old_result.get("found") or not old_result.get("wallets"):
+            continue
+        identity = _result_identity(old_result)
+        old_wallets = set(old_result.get("wallets") or [])
+        if identity in seen or old_wallets.issubset(new_wallets):
+            continue
+        restored = copy.deepcopy(old_result)
+        restored["restored_from_cache"] = True
+        results.insert(0, restored)
+        seen.add(identity)
+        new_wallets.update(old_wallets)
+
+    found = [r for r in results if r.get("found")]
+    not_found = [r for r in results if not r.get("found")]
+    merged["results"] = found + not_found
+    merged["found_count"] = len(found)
+    merged["all_wallets"] = list(dict.fromkeys(
+        w for r in found for w in (r.get("wallets") or []) if w
+    ))
+    return merged
 
 
 def _clean_result(result: dict, username: str, elapsed_ms: int, error: str | None = None) -> dict:
@@ -844,11 +905,54 @@ def _clean_result(result: dict, username: str, elapsed_ms: int, error: str | Non
     for wallet in result.get("wallets") or []:
         if not wallet:
             continue
+        wallet = str(wallet).strip()
+        if wallet.lower() in {"domain not found", "not found", "none", "null"}:
+            continue
         if wallet.startswith("0x") and not is_real_wallet(wallet):
             continue
         wallets.append(wallet)
     result["wallets"] = list(dict.fromkeys(wallets))
     return result
+
+
+def _platform_cache_values(username: str, variants: dict, result: dict | None = None) -> set[str]:
+    values = {username.strip().lower()}
+    values.update(str(v).lower() for v in variants.get("base", []) if v)
+    values.update(str(v).lower() for v in variants.get("domains", []) if v)
+    if result:
+        matched = result.get("matched")
+        if matched:
+            values.add(str(matched).lower())
+    return values
+
+
+def _remember_platform_hit(fn_name: str, username: str, variants: dict, result: dict):
+    if not result.get("found") or not result.get("wallets"):
+        return
+    payload = copy.deepcopy(result)
+    now = time.time()
+    for value in _platform_cache_values(username, variants, result):
+        _PLATFORM_HIT_CACHE[(fn_name, value)] = (now, payload)
+    if len(_PLATFORM_HIT_CACHE) > 2048:
+        oldest = sorted(_PLATFORM_HIT_CACHE.items(), key=lambda item: item[1][0])[:512]
+        for key, _ in oldest:
+            _PLATFORM_HIT_CACHE.pop(key, None)
+
+
+def _get_platform_hit(fn_name: str, username: str, variants: dict) -> dict | None:
+    now = time.time()
+    for value in _platform_cache_values(username, variants):
+        entry = _PLATFORM_HIT_CACHE.get((fn_name, value))
+        if not entry:
+            continue
+        created, result = entry
+        if now - created > PLATFORM_HIT_CACHE_SECONDS:
+            _PLATFORM_HIT_CACHE.pop((fn_name, value), None)
+            continue
+        cached = copy.deepcopy(result)
+        cached["platform_cache_hit"] = True
+        return cached
+    return None
 
 
 async def _run_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
@@ -861,7 +965,13 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         cleaned = _clean_result(result, username, elapsed_ms)
+        if not cleaned.get("found"):
+            cached_hit = _get_platform_hit(fn.__name__, username, variants)
+            if cached_hit:
+                cached_hit["elapsed_ms"] = elapsed_ms
+                return cached_hit
         if cleaned.get("found"):
+            _remember_platform_hit(fn.__name__, username, variants, cleaned)
             log.info(
                 "search hit platform=%s matched=%s wallets=%s elapsed_ms=%s",
                 cleaned.get("platform"),

@@ -2,14 +2,14 @@
 Crypto OSINT Bot — тарифы, хеш транзы, поддержка
 """
 
-import asyncio, csv, io, logging, os, time
+import asyncio, logging, os, time
 from collections import defaultdict
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            CallbackQueryHandler, filters, ContextTypes)
 from telegram.constants import ParseMode
 
-from searcher import extract_username, run_search, run_bulk_search, reverse_lookup, is_eth_address, get_variants, enrich_balances, GOLDRUSH_API_KEY
+from searcher import extract_username, run_search, reverse_lookup, is_eth_address, get_variants, enrich_balances, GOLDRUSH_API_KEY
 from database import init_db, close_pool, get_pool
 from access  import (
     get_or_create_user, check_access, use_search, get_user_stats,
@@ -19,8 +19,7 @@ from access  import (
     get_admin_stats,
     grant_subscription, grant_trial_searches,
     start_payment_hash, get_pending_payment,
-    check_bulk_access, get_bulk_status, grant_bulk_access, revoke_bulk_access,
-    consume_bulk_credit,
+    get_bulk_status, grant_bulk_access, revoke_bulk_access,
     request_bulk_payment, start_bulk_hash, get_pending_bulk,
     submit_bulk_hash, confirm_bulk_payment,
     PAYMENT_ADDRESS, TRIAL_SEARCHES, TRIAL_HOURS,
@@ -37,16 +36,7 @@ MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
 
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
-MAX_BULK_LINES = int(os.getenv("MAX_BULK_LINES", "10000"))
-BULK_WORKERS = int(os.getenv("BULK_WORKERS", "20"))
-BULK_MAX_ACTIVE_JOBS = int(os.getenv("BULK_MAX_ACTIVE_JOBS", "2"))
-BULK_MAX_FILE_BYTES = int(os.getenv("BULK_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
-BULK_PROGRESS_STEP = int(os.getenv("BULK_PROGRESS_STEP", "250"))
-BULK_INCLUDE_BALANCES = os.getenv("BULK_INCLUDE_BALANCES", "true").lower() == "true"
-
 _user_requests: dict[int, list[float]] = defaultdict(list)
-_active_bulk_users: set[int] = set()
-_bulk_slots = asyncio.Semaphore(BULK_MAX_ACTIVE_JOBS)
 
 
 def check_rate_limit(user_id: int) -> bool:
@@ -168,7 +158,6 @@ def kb_main(is_admin=False):
     if is_admin:
         rows = [
             [InlineKeyboardButton("👥 Рефералы",        callback_data="admin_refs")],
-            [InlineKeyboardButton("📦 Bulk по файлу",   callback_data="bulk_info")],
             [InlineKeyboardButton("🛒 Купить Bulk",     callback_data="bulk_buy")],
         ]
         if bulk_web_row:
@@ -184,7 +173,6 @@ def kb_main(is_admin=False):
         [InlineKeyboardButton("🔗 Моя реф-ссылка",  callback_data="myref")],
         [InlineKeyboardButton("👥 Мои рефералы",     callback_data="my_referrals")],
         [InlineKeyboardButton("💳 Купить подписку",  callback_data="buy")],
-        [InlineKeyboardButton("📦 Bulk по файлу",    callback_data="bulk_info")],
         [InlineKeyboardButton("🛒 Купить Bulk",      callback_data="bulk_buy")],
     ]
     if bulk_web_row:
@@ -200,6 +188,15 @@ def kb_back():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("← Назад", callback_data="back_main")]
     ])
+
+
+def kb_bulk_web():
+    rows = []
+    if valid_webapp_url(MINIAPP_URL):
+        rows.append([InlineKeyboardButton("📊 Открыть Bulk Web App", web_app=WebAppInfo(url=MINIAPP_URL))])
+    rows.append([InlineKeyboardButton("🛒 Купить Bulk", callback_data="bulk_buy")])
+    rows.append([InlineKeyboardButton("← Назад", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
 
 
 def kb_plans():
@@ -611,43 +608,20 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Bulk: инфо / статус ───────────────────────────────────────────────────
     if data == "bulk_info":
         status = await get_bulk_status(uid)
-        if status["active"]:
-            await q.edit_message_text(
-                "<b>📦 Bulk по файлу</b>\n\n"
-                f"✅ Осталось поисков: <b>{status['credits']}</b>\n"
-                "Один загруженный файл = один поиск.\n\n"
-                "Пришли <code>.txt</code> или <code>.csv</code> со списком "
-                "<code>@username</code> (по одному на строку) и бот проверит "
-                "их пачкой, вернёт CSV с найденными кошельками.\n\n"
-                f"Лимит: до {MAX_BULK_LINES} строк, файл до "
-                f"{BULK_MAX_FILE_BYTES // 1024 // 1024} MB.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("➕ Докупить поиски", callback_data="bulk_buy")],
-                    [InlineKeyboardButton("← Назад",            callback_data="back_main")],
-                ]))
-            return
         await q.edit_message_text(
-            "<b>📦 Bulk по файлу — отдельная функция</b>\n\n"
-            "Кидаешь <code>.txt</code>/<code>.csv</code> со списком "
-            "<code>@username</code> (по одному на строку) — бот сканит всех "
-            "пачкой и возвращает CSV с кошельками, платформами и балансами.\n\n"
-            "Оплата за количество поисков: один файл = один поиск.\n\n"
-            f"Лимит: до {MAX_BULK_LINES} строк за поиск, файл до "
-            f"{BULK_MAX_FILE_BYTES // 1024 // 1024} MB.",
+            "<b>📊 Bulk Search теперь работает через Web App</b>\n\n"
+            f"Осталось bulk-поисков: <b>{status['credits']}</b>\n\n"
+            "Открой Web App, загрузи <code>.txt</code>/<code>.csv</code> со списком "
+            "<code>@username</code> и забери результат в удобной таблице.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Купить Bulk", callback_data="bulk_buy")],
-                [InlineKeyboardButton("🆘 Поддержка",   url=f"https://t.me/{SUPPORT_USER}")],
-                [InlineKeyboardButton("← Назад",        callback_data="back_main")],
-            ]))
+            reply_markup=kb_bulk_web())
         return
 
     # ── Bulk: выбор тарифа ────────────────────────────────────────────────────
     if data == "bulk_buy":
         await q.edit_message_text(
-            "<b>📦 Bulk по файлу — выбери тариф</b>\n\n"
-            "После оплаты доступ к загрузке файлов включится автоматически:",
+            "<b>📊 Bulk Web App — выбери тариф</b>\n\n"
+            "После оплаты bulk-поиски начислятся на аккаунт, а запускать их можно в Web App:",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_bulk_plans())
         return
@@ -711,7 +685,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "📝 <b>Пришли хеш транзакции (Bulk)</b>\n\n"
             "Скопируй txid из кошелька и отправь сюда.\n"
-            "Мы проверим и включим доступ к загрузке файлов.",
+            "Мы проверим оплату и начислим bulk-поиски для Web App.",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("← Отмена", callback_data="bulk_cancel_hash")]
@@ -742,273 +716,17 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
 
-def parse_bulk_usernames(text: str, limit: int = MAX_BULK_LINES) -> tuple[list[str], int]:
-    usernames = []
-    seen = set()
-    total_lines = 0
-    for line in text.splitlines():
-        total_lines += 1
-        raw = line.strip()
-        if not raw:
-            continue
-        first_cell = raw.split(",", 1)[0].split(";", 1)[0].split("\t", 1)[0].strip()
-        username = extract_username(first_cell)
-        if not username:
-            continue
-        key = username.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        usernames.append(username)
-        if len(usernames) >= limit:
-            break
-    return usernames, total_lines
-
-
-def bulk_result_to_csv(results: list[dict], balances: dict | None = None) -> bytes:
-    balances = balances or {}
-    show_balance = bool(balances)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    header = [
-        "username", "found_count", "wallets", "platforms",
-        "matched", "cache_hit", "elapsed_ms", "errors",
-    ]
-    if show_balance:
-        header[3:3] = ["wallet_balances_usd", "wallet_top_tokens", "wallet_chains"]
-    writer.writerow(header)
-
-    def _short(w: str) -> str:
-        return f"{w[:6]}…{w[-4:]}" if len(w) > 12 else w
-
-    def _csv_safe(value) -> str:
-        text = str(value or "")
-        if text.startswith(("=", "+", "-", "@")):
-            return "'" + text
-        return text
-
-    for data in results:
-        found = [r for r in data.get("results", []) if r.get("found")]
-        wallets = data.get("all_wallets") or []
-        platforms = list(dict.fromkeys(r.get("platform", "") for r in found if r.get("platform")))
-        matched = list(dict.fromkeys(str(r.get("matched") or "") for r in found if r.get("matched")))
-        errors = data.get("diagnostics", {}).get("errors", [])
-        row = [
-            _csv_safe(data.get("username", "")),
-            data.get("found_count", 0),
-            _csv_safe(" ".join(wallets)),
-            _csv_safe(" | ".join(platforms)),
-            _csv_safe(" | ".join(matched)),
-            int(bool(data.get("cache_hit"))),
-            data.get("diagnostics", {}).get("elapsed_ms", 0),
-            _csv_safe(" | ".join(f"{e.get('platform')}: {e.get('error')}" for e in errors)),
-        ]
-        if show_balance:
-            bal_parts, tok_parts, chain_parts = [], [], []
-            for w in wallets:
-                info = balances.get(w) or {}
-                usd = info.get("balance_usd")
-                if isinstance(usd, (int, float)):
-                    bal_parts.append(f"{w}=${usd:,.2f}")
-                else:
-                    bal_parts.append(f"{w}={info.get('note') or 'n/a'}")
-                if info.get("top_tokens"):
-                    tok_parts.append(f"{_short(w)}: {', '.join(info['top_tokens'][:5])}")
-                if info.get("chains"):
-                    chain_parts.append(f"{_short(w)}: {','.join(info['chains'])}")
-            row[3:3] = [_csv_safe(" | ".join(bal_parts)), _csv_safe(" | ".join(tok_parts)), _csv_safe(" | ".join(chain_parts))]
-        writer.writerow(row)
-    return output.getvalue().encode("utf-8-sig")
-
-
-async def run_bulk_job(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, usernames: list[str], status_message_id: int):
-    started = time.perf_counter()
-    order = {username: idx for idx, username in enumerate(usernames)}
-    results: list[dict] = []
-    processed = 0
-    found_count = 0
-    lock = asyncio.Lock()
-    worker_sem = asyncio.Semaphore(BULK_WORKERS)
-    last_update = 0.0
-
-    async def update_progress(force: bool = False):
-        nonlocal last_update
-        now = time.time()
-        if not force and now - last_update < 10:
-            return
-        last_update = now
-        elapsed = max(1, int(time.perf_counter() - started))
-        speed = processed / elapsed
-        left = len(usernames) - processed
-        eta = int(left / speed) if speed > 0 else 0
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=status_message_id,
-                text=(
-                    f"📦 Bulk search\n\n"
-                    f"Проверено: <b>{processed}/{len(usernames)}</b>\n"
-                    f"Найдено: <b>{found_count}</b>\n"
-                    f"Скорость: <b>{speed:.2f} users/sec</b>\n"
-                    f"ETA: <b>{eta // 60}м {eta % 60}с</b>"
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            log.debug("Failed to update bulk progress", exc_info=True)
-
-    async def scan_one(username: str):
-        nonlocal processed, found_count
-        async with worker_sem:
-            try:
-                data = await run_bulk_search(username)
-            except Exception as exc:
-                data = {
-                    "username": username,
-                    "found_count": 0,
-                    "all_wallets": [],
-                    "results": [],
-                    "diagnostics": {"elapsed_ms": 0, "errors": [{"platform": "bulk", "error": str(exc)[:120]}]},
-                    "cache_hit": False,
-                }
-            async with lock:
-                results.append(data)
-                processed += 1
-                if data.get("found_count", 0) > 0:
-                    found_count += 1
-                if processed % BULK_PROGRESS_STEP == 0 or processed == len(usernames):
-                    await update_progress(force=True)
-
-    _active_bulk_users.add(user_id)
-    try:
-        async with _bulk_slots:
-            await update_progress(force=True)
-            await asyncio.gather(*(scan_one(username) for username in usernames))
-            results.sort(key=lambda item: order.get(item.get("username", ""), 10**9))
-
-            # ── Балансы найденных кошельков (GoldRush, USD) ──────────────────
-            balances: dict = {}
-            if BULK_INCLUDE_BALANCES:
-                all_wallets = list(dict.fromkeys(
-                    w for data in results for w in (data.get("all_wallets") or [])
-                ))
-                if all_wallets:
-                    try:
-                        await ctx.bot.edit_message_text(
-                            chat_id=chat_id, message_id=status_message_id,
-                            text=(f"📦 Bulk search\n\n"
-                                  f"Проверено: <b>{len(usernames)}/{len(usernames)}</b>\n"
-                                  f"Найдено: <b>{found_count}</b>\n"
-                                  f"💰 Считаю балансы кошельков: <b>{len(all_wallets)}</b>..."),
-                            parse_mode=ParseMode.HTML,
-                        )
-                    except Exception:
-                        pass
-                    balances = await enrich_balances(all_wallets)
-
-            csv_bytes = bulk_result_to_csv(results, balances)
-            elapsed = int(time.perf_counter() - started)
-
-            if balances:
-                wallets_priced = sum(
-                    1 for b in balances.values()
-                    if isinstance(b.get("balance_usd"), (int, float))
-                )
-                balance_line = f"\n💰 Балансы посчитаны: {wallets_priced} кошельков (точные цифры в CSV)"
-            else:
-                balance_line = "\n💡 Балансы выключены (нет GOLDRUSH_API_KEY)"
-
-            await ctx.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(io.BytesIO(csv_bytes), filename="bulk_results.csv"),
-                caption=(
-                    f"✅ Bulk готов\n"
-                    f"Строк: {len(usernames)}\n"
-                    f"С найденными кошельками: {found_count}\n"
-                    f"Время: {elapsed // 60}м {elapsed % 60}с"
-                    f"{balance_line}"
-                ),
-            )
-            await update_progress(force=True)
-    finally:
-        _active_bulk_users.discard(user_id)
-
-
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     uname = update.effective_user.username or str(uid)
-    doc = update.message.document
     await get_or_create_user(uid, uname)
 
-    if not doc:
-        return
-    filename = doc.file_name or "users.txt"
-    if not filename.lower().endswith((".txt", ".csv")):
-        await update.message.reply_text("Пришли .txt или .csv файл со списком usernames.")
-        return
-    if doc.file_size and doc.file_size > BULK_MAX_FILE_BYTES:
-        await update.message.reply_text(
-            f"Файл слишком большой. Лимит: {BULK_MAX_FILE_BYTES // 1024 // 1024} MB."
-        )
-        return
-
-    if not is_admin(uid):
-        allowed = (uid in BULK_USER_IDS) or await check_bulk_access(uid)
-        if not allowed:
-            await update.message.reply_text(
-                "🔒 <b>Bulk по файлу</b> — отдельная платная функция.\n"
-                "Оформи доступ, чтобы сканить списки пачкой.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Купить Bulk", callback_data="bulk_buy")],
-                    [InlineKeyboardButton("🆘 Поддержка",   url=f"https://t.me/{SUPPORT_USER}")],
-                ]))
-            return
-
-    if uid in _active_bulk_users:
-        await update.message.reply_text("У тебя уже идёт bulk-задача. Дождись CSV-результата.")
-        return
-    if _bulk_slots.locked():
-        await update.message.reply_text("Сейчас bulk-слоты заняты. Попробуй позже.")
-        return
-
-    file = await doc.get_file()
-    buffer = io.BytesIO()
-    await file.download_to_memory(out=buffer)
-    text = buffer.getvalue().decode("utf-8-sig", errors="ignore")
-    usernames, total_lines = parse_bulk_usernames(text)
-
-    if not usernames:
-        await update.message.reply_text("Не нашёл usernames в файле. Формат: по одному @username на строку.")
-        return
-    if total_lines > MAX_BULK_LINES and len(usernames) >= MAX_BULK_LINES:
-        note = f"\n\n⚠️ Взял первые {MAX_BULK_LINES} уникальных usernames."
-    else:
-        note = ""
-
-    # Списываем один прогон. Админ и allowlist — безлимит.
-    unlimited = is_admin(uid) or (uid in BULK_USER_IDS)
-    remaining = None
-    if not unlimited:
-        remaining = await consume_bulk_credit(uid)
-        if remaining is None:
-            await update.message.reply_text(
-                "🔒 У тебя закончились bulk-поиски.\nДокупи пакет, чтобы продолжить.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("💳 Купить Bulk", callback_data="bulk_buy")],
-                ]))
-            return
-    credit_line = "" if unlimited else f"\nОсталось поисков: <b>{remaining}</b>"
-
-    status = await update.message.reply_text(
-        f"📦 Bulk search принят\n\n"
-        f"Строк в файле: <b>{total_lines}</b>\n"
-        f"Уникальных usernames: <b>{len(usernames)}</b>\n"
-        f"Workers: <b>{BULK_WORKERS}</b>{credit_line}{note}",
+    await update.message.reply_text(
+        "<b>📊 Bulk Search теперь только в Web App</b>\n\n"
+        "Файлы <code>.txt</code>/<code>.csv</code> больше не обрабатываются прямо в чате.\n"
+        "Открой Web App, загрузи список там и смотри результат в таблице.",
         parse_mode=ParseMode.HTML,
-    )
-    ctx.application.create_task(run_bulk_job(ctx, update.effective_chat.id, uid, usernames, status.message_id))
+        reply_markup=kb_bulk_web())
 
 
 # ─── Текстовые сообщения ──────────────────────────────────────────────────────
@@ -1420,9 +1138,9 @@ async def cmd_confirmbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             user_id,
             f"✅ <b>Оплата Bulk подтверждена!</b>\n\n"
             f"Начислено поисков: <b>{res['credits']}</b>. Всего доступно: <b>{res['total']}</b>.\n"
-            f"Пришли .txt/.csv со списком @username, один файл = один поиск.",
+            f"Открой Bulk Web App, загрузи .txt/.csv со списком @username и запусти поиск там.",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_main())
+            reply_markup=kb_bulk_web())
     except Exception:
         pass
 
@@ -1447,8 +1165,9 @@ async def cmd_grantbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await ctx.bot.send_message(
             user_id,
-            f"✅ Тебе начислили <b>{count}</b> bulk-поисков. Всего доступно: <b>{total}</b>.",
-            parse_mode=ParseMode.HTML, reply_markup=kb_main())
+            f"✅ Тебе начислили <b>{count}</b> bulk-поисков. Всего доступно: <b>{total}</b>.\n\n"
+            f"Запуск bulk теперь доступен через Web App.",
+            parse_mode=ParseMode.HTML, reply_markup=kb_bulk_web())
     except Exception:
         pass
 

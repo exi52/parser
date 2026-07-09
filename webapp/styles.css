@@ -397,12 +397,33 @@ p {
 .toolbar {
   min-height: 62px;
   display: grid;
-  grid-template-columns: auto minmax(180px, 1fr) auto;
+  grid-template-columns: auto minmax(150px, .72fr) minmax(190px, 1fr) auto auto;
   align-items: center;
   gap: 10px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
   background: rgba(16, 21, 29, .96);
+}
+
+.tableExport {
+  min-width: 48px;
+  min-height: 40px;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 800;
+  text-decoration: none;
+}
+
+.tableExport:hover {
+  border-color: rgba(79, 209, 139, .65);
+  background: rgba(79, 209, 139, .09);
 }
 
 .switch {
