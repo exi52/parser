@@ -269,7 +269,11 @@ def kb_bulk_networks(plan_id: str):
 
 # ─── Форматирование поиска ────────────────────────────────────────────────────
 
-async def fmt_search(data: dict, balances: dict | None = None) -> str:
+async def fmt_search(
+    data: dict,
+    balances: dict | None = None,
+    show_balance_error: bool = False,
+) -> str:
     balances = balances or {}
 
     def _bal_line(w: str):
@@ -285,7 +289,8 @@ async def fmt_search(data: dict, balances: dict | None = None) -> str:
         if info.get("chains"):
             bits.append(", ".join(info["chains"]))
         if not bits and info.get("note") not in (None, "", "empty_solana"):
-            return "⚠️ баланс временно недоступен"
+            detail = f" <code>{esc(info['note'])}</code>" if show_balance_error else ""
+            return f"⚠️ баланс временно недоступен{detail}"
         if not bits:
             return None
         return " · ".join(bits)
@@ -882,7 +887,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         data = await run_search(username)
         technical_failure = search_failed_technically(data)
         balances = await enrich_balances(data["all_wallets"]) if data.get("all_wallets") else {}
-        text    = await fmt_search(data, balances)
+        text    = await fmt_search(data, balances, show_balance_error=is_admin(uid))
         if technical_failure:
             text += "\n\n<i>Источники временно недоступны — поиск не списан.</i>"
         buttons = wallet_buttons(data["all_wallets"])

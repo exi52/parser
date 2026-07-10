@@ -237,7 +237,8 @@ function balanceLine(balances) {
     if (tokens.length) parts.push(esc(tokens.join(", ")));
     if (chains.length) parts.push(`<span>${esc(chains.join(", "))}</span>`);
     if (!parts.length && note && note !== "empty_solana") {
-      parts.push(`<span class="errorText">Balance temporarily unavailable</span>`);
+      const detail = state.me && state.me.admin ? ` (${esc(note)})` : "";
+      parts.push(`<span class="errorText">Balance temporarily unavailable${detail}</span>`);
     }
     return parts.length ? `<div class="balanceRow"><code>${esc(shortWallet(wallet))}</code>${parts.join(" · ")}</div>` : "";
   }).filter(Boolean).join("");
