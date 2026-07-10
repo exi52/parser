@@ -227,6 +227,7 @@ function balanceLine(balances) {
   return Object.entries(balances).map(([wallet, info]) => {
     if (!info || typeof info !== "object") return "";
     const usd = info.balance_usd;
+    const note = String(info.note || "");
     const tokens = Array.isArray(info.top_tokens) ? info.top_tokens.slice(0, 3) : [];
     const chains = Array.isArray(info.chains) ? info.chains : [];
     const parts = [];
@@ -235,6 +236,9 @@ function balanceLine(balances) {
     }
     if (tokens.length) parts.push(esc(tokens.join(", ")));
     if (chains.length) parts.push(`<span>${esc(chains.join(", "))}</span>`);
+    if (!parts.length && note && note !== "empty_solana") {
+      parts.push(`<span class="errorText">Balance temporarily unavailable</span>`);
+    }
     return parts.length ? `<div class="balanceRow"><code>${esc(shortWallet(wallet))}</code>${parts.join(" · ")}</div>` : "";
   }).filter(Boolean).join("");
 }

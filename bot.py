@@ -284,6 +284,8 @@ async def fmt_search(data: dict, balances: dict | None = None) -> str:
             bits.append(", ".join(info["top_tokens"][:3]))
         if info.get("chains"):
             bits.append(", ".join(info["chains"]))
+        if not bits and info.get("note") not in (None, "", "empty_solana"):
+            return "⚠️ баланс временно недоступен"
         if not bits:
             return None
         return " · ".join(bits)

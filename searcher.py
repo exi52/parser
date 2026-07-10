@@ -30,10 +30,11 @@ GOLDRUSH_CHAINS     = os.getenv(
     "eth-mainnet,base-mainnet,matic-mainnet,bsc-mainnet,arbitrum-mainnet,optimism-mainnet",
 )
 GOLDRUSH_TIMEOUT    = int(os.getenv("GOLDRUSH_TIMEOUT", "20"))
-GOLDRUSH_CONCURRENCY = int(os.getenv("GOLDRUSH_CONCURRENCY", "5"))
+GOLDRUSH_CONCURRENCY = max(1, int(os.getenv("GOLDRUSH_CONCURRENCY", "8")))
+GOLDRUSH_RPS = max(1, int(os.getenv("GOLDRUSH_RPS", "4")))
 GOLDRUSH_CACHE_SECONDS = int(os.getenv("GOLDRUSH_CACHE_SECONDS", "1800"))
+GOLDRUSH_RETRIES = max(1, int(os.getenv("GOLDRUSH_RETRIES", "3")))
 BALANCE_MAX_TOKEN_USD = float(os.getenv("BALANCE_MAX_TOKEN_USD", "100000000000"))
-BALANCE_MAX_WALLET_USD = float(os.getenv("BALANCE_MAX_WALLET_USD", "500000000000"))
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet.solana.com")
 SOLANA_TIMEOUT = int(os.getenv("SOLANA_TIMEOUT", "12"))
@@ -44,6 +45,10 @@ SOLANA_SOL_PRICE_ID = os.getenv(
 )
 
 _BALANCE_CACHE: dict[str, tuple[float, dict]] = {}
+_BALANCE_INFLIGHT: dict[str, asyncio.Task] = {}
+_BALANCE_SEMAPHORE = asyncio.Semaphore(max(GOLDRUSH_CONCURRENCY, 1))
+_GOLDRUSH_RATE_LOCK = asyncio.Lock()
+_GOLDRUSH_NEXT_REQUEST = 0.0
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
 _BULK_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
@@ -1224,8 +1229,6 @@ def _blank_balance(addr: str, note: str = "") -> dict:
 
 
 def _safe_usd_quote(item: dict) -> float | None:
-    if item.get("is_spam") is True or item.get("spam") is True:
-        return None
     try:
         quote = float(item.get("quote"))
     except (TypeError, ValueError):
@@ -1233,6 +1236,62 @@ def _safe_usd_quote(item: dict) -> float | None:
     if not math.isfinite(quote) or quote < 0 or quote > BALANCE_MAX_TOKEN_USD:
         return None
     return quote
+
+
+async def _goldrush_json(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict,
+    params: dict | None = None,
+) -> tuple[dict | None, str]:
+    """Request GoldRush with retry and reject API error envelopes."""
+    global _GOLDRUSH_NEXT_REQUEST
+    last_note = "goldrush_error"
+    for attempt in range(GOLDRUSH_RETRIES):
+        async with _GOLDRUSH_RATE_LOCK:
+            now = time.monotonic()
+            delay = max(0.0, _GOLDRUSH_NEXT_REQUEST - now)
+            if delay:
+                await asyncio.sleep(delay)
+            _GOLDRUSH_NEXT_REQUEST = max(time.monotonic(), _GOLDRUSH_NEXT_REQUEST) + (1 / GOLDRUSH_RPS)
+        try:
+            response = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=GOLDRUSH_TIMEOUT,
+            )
+        except httpx.TimeoutException:
+            last_note = "goldrush_timeout"
+        except Exception as exc:
+            last_note = f"goldrush_error:{str(exc)[:60]}"
+        else:
+            if response.status_code == 429:
+                last_note = "goldrush_rate_limited"
+            elif response.status_code >= 500:
+                last_note = f"goldrush_http_{response.status_code}"
+            elif response.status_code >= 400:
+                return None, f"goldrush_http_{response.status_code}"
+            else:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    last_note = "goldrush_bad_json"
+                else:
+                    if not isinstance(payload, dict):
+                        last_note = "goldrush_bad_payload"
+                    elif payload.get("error"):
+                        message = payload.get("error_message") or payload.get("error_code") or "api_error"
+                        last_note = f"goldrush_api_error:{str(message)[:60]}"
+                    elif not isinstance(payload.get("data"), dict):
+                        last_note = "goldrush_missing_data"
+                    else:
+                        return payload, ""
+
+        if attempt < GOLDRUSH_RETRIES - 1:
+            await asyncio.sleep(0.5 * (2 ** attempt))
+
+    return None, last_note
 
 
 async def _fetch_sol_price_usd(client: httpx.AsyncClient) -> float | None:
@@ -1270,20 +1329,14 @@ async def fetch_solana_goldrush_balance(client: httpx.AsyncClient, address: str)
 
     url = f"https://api.covalenthq.com/v1/solana-mainnet/address/{address}/balances_v2/"
     headers = {**HEADERS, "Authorization": f"Bearer {GOLDRUSH_API_KEY}"}
-    try:
-        resp = await client.get(url, headers=headers, timeout=GOLDRUSH_TIMEOUT)
-        if resp.status_code == 429:
-            return _blank_balance(address, "goldrush_solana_rate_limited")
-        resp.raise_for_status()
-        payload = resp.json()
-    except httpx.TimeoutException:
-        return _blank_balance(address, "goldrush_solana_timeout")
-    except Exception as exc:
-        log.debug("goldrush solana balance failed address=%s error=%s", address, exc)
+    payload, error = await _goldrush_json(client, url, headers)
+    if payload is None:
+        log.warning("GoldRush Solana failed address=%s error=%s", address, error)
         return None
 
     items = ((payload or {}).get("data") or {}).get("items") or []
     total = 0.0
+    valid_quotes = 0
     tokens: list[tuple[str, float, str]] = []
     for item in items:
         if not isinstance(item, dict):
@@ -1292,14 +1345,13 @@ async def fetch_solana_goldrush_balance(client: httpx.AsyncClient, address: str)
         sym = item.get("contract_ticker_symbol") or item.get("contract_name") or "?"
         pretty = item.get("pretty_quote")
         if quote is not None:
+            valid_quotes += 1
             total += quote
             if quote >= 1:
                 tokens.append((str(sym), quote, str(pretty or "")))
 
-    if total > BALANCE_MAX_WALLET_USD:
-        log.warning("discarding anomalous Solana balance address=%s total=%s", address, total)
-        return _blank_balance(address, "anomalous_balance")
-
+    if items and valid_quotes == 0:
+        return _blank_balance(address, "no_valid_quotes")
     tokens.sort(key=lambda token: token[1], reverse=True)
     result = {
         "address": address,
@@ -1395,19 +1447,14 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
     url = f"https://api.covalenthq.com/v1/allchains/address/{address}/balances/"
     params = {"chains": GOLDRUSH_CHAINS, "limit": 100}
     headers = {**HEADERS, "Authorization": f"Bearer {GOLDRUSH_API_KEY}"}
-    try:
-        resp = await client.get(url, params=params, headers=headers, timeout=GOLDRUSH_TIMEOUT)
-        if resp.status_code == 429:
-            return _blank_balance(address, "rate_limited")
-        resp.raise_for_status()
-        payload = resp.json()
-    except httpx.TimeoutException:
-        return _blank_balance(address, "timeout")
-    except Exception as exc:
-        return _blank_balance(address, f"error:{str(exc)[:60]}")
+    payload, error = await _goldrush_json(client, url, headers, params=params)
+    if payload is None:
+        log.warning("GoldRush EVM failed address=%s error=%s", address, error)
+        return _blank_balance(address, error)
 
     items = ((payload or {}).get("data") or {}).get("items") or []
     total = 0.0
+    valid_quotes = 0
     chains: list[str] = []
     tokens: list[tuple[str, float]] = []
     for it in items:
@@ -1415,6 +1462,7 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
             continue
         quote = _safe_usd_quote(it)
         if quote is not None:
+            valid_quotes += 1
             total += quote
             sym = it.get("contract_ticker_symbol") or "?"
             if quote >= 1:
@@ -1423,10 +1471,8 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
         if chain and chain not in chains:
             chains.append(chain)
 
-    if total > BALANCE_MAX_WALLET_USD:
-        log.warning("discarding anomalous EVM balance address=%s total=%s", address, total)
-        return _blank_balance(address, "anomalous_balance")
-
+    if items and valid_quotes == 0:
+        return _blank_balance(address, "no_valid_quotes")
     tokens.sort(key=lambda t: t[1], reverse=True)
     result = {
         "address": address,
@@ -1439,17 +1485,56 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
     return result
 
 
-async def enrich_balances(addresses: list[str]) -> dict[str, dict]:
-    """Возвращает {address: balance_dict} для списка адресов. Только EVM считаются по USD."""
+async def _fetch_balance_shared(client: httpx.AsyncClient, address: str) -> dict:
+    cached = _balance_cached(address)
+    if cached is not None:
+        return cached
+
+    key = address.lower()
+    task = _BALANCE_INFLIGHT.get(key)
+    if task is None:
+        async def fetch():
+            async with _BALANCE_SEMAPHORE:
+                return await fetch_wallet_balance(client, address)
+
+        task = asyncio.create_task(fetch())
+        _BALANCE_INFLIGHT[key] = task
+
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if task.done() and _BALANCE_INFLIGHT.get(key) is task:
+            _BALANCE_INFLIGHT.pop(key, None)
+
+
+async def enrich_balances(
+    addresses: list[str],
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, dict]:
+    """Return wallet balances, optionally reusing a caller-owned HTTP client."""
     uniq = list(dict.fromkeys(a for a in addresses if a))
     out: dict[str, dict] = {}
     if not uniq:
         return out
-    sem = asyncio.Semaphore(max(GOLDRUSH_CONCURRENCY, 1))
-    timeout = max(GOLDRUSH_TIMEOUT, SOLANA_TIMEOUT)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as client:
+
+    async def run(active_client: httpx.AsyncClient):
         async def one(addr: str):
-            async with sem:
-                out[addr] = await fetch_wallet_balance(client, addr)
+            out[addr] = await _fetch_balance_shared(active_client, addr)
+
         await asyncio.gather(*(one(a) for a in uniq))
+
+    if client is not None:
+        await run(client)
+    else:
+        timeout = max(GOLDRUSH_TIMEOUT, SOLANA_TIMEOUT)
+        limits = httpx.Limits(
+            max_connections=max(GOLDRUSH_CONCURRENCY, 5),
+            max_keepalive_connections=max(GOLDRUSH_CONCURRENCY, 5),
+        )
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            limits=limits,
+        ) as owned_client:
+            await run(owned_client)
     return out

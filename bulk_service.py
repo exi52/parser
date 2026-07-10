@@ -10,11 +10,14 @@ import os
 import time
 from typing import Any
 
+import httpx
+
 from database import get_pool
 from searcher import extract_username, run_bulk_search, enrich_balances, GOLDRUSH_API_KEY
 
 MAX_BULK_LINES = int(os.getenv("MAX_BULK_LINES", "10000"))
-BULK_WORKERS = int(os.getenv("BULK_WORKERS", "20"))
+BULK_WORKERS = max(1, int(os.getenv("BULK_WORKERS", "20")))
+BULK_BALANCE_WORKERS = max(1, int(os.getenv("BULK_BALANCE_WORKERS", "8")))
 BULK_INCLUDE_BALANCES = os.getenv("BULK_INCLUDE_BALANCES", "true").lower() == "true"
 BULK_JOB_TIMEOUT_SECONDS = int(os.getenv("BULK_JOB_TIMEOUT_SECONDS", "7200"))
 BULK_MAX_ACTIVE_JOBS = int(os.getenv("BULK_MAX_ACTIVE_JOBS", "2"))
@@ -315,15 +318,18 @@ async def process_bulk_job(job_id: int):
                             ORDER BY id ASC
                         """, job_id)
 
-                    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                    search_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                    balance_queue: asyncio.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = asyncio.Queue(
+                        maxsize=max(BULK_BALANCE_WORKERS * 4, 100)
+                    )
                     for row in rows:
-                        await queue.put(dict(row))
+                        await search_queue.put(dict(row))
                     for _ in range(BULK_WORKERS):
-                        await queue.put(None)
+                        await search_queue.put(None)
 
-                    async def worker():
+                    async def search_worker():
                         while True:
-                            item = await queue.get()
+                            item = await search_queue.get()
                             try:
                                 if item is None:
                                     return
@@ -332,19 +338,57 @@ async def process_bulk_job(job_id: int):
                                     continue
 
                                 data = await run_bulk_search(item["username"])
-                                balances = {}
                                 if BULK_INCLUDE_BALANCES and data.get("all_wallets"):
-                                    balances = await enrich_balances(data["all_wallets"])
-                                await _store_item_result(job_id, item["id"], data, balances)
+                                    await balance_queue.put((item, data))
+                                else:
+                                    await _store_item_result(job_id, item["id"], data, {})
                             except Exception as exc:
                                 if item is not None:
                                     await _store_item_error(job_id, item["id"], str(exc))
                             finally:
-                                queue.task_done()
+                                search_queue.task_done()
 
-                    workers = [asyncio.create_task(worker()) for _ in range(BULK_WORKERS)]
-                    await queue.join()
-                    await asyncio.gather(*workers, return_exceptions=True)
+                    async def balance_worker(balance_client: httpx.AsyncClient):
+                        while True:
+                            payload = await balance_queue.get()
+                            try:
+                                if payload is None:
+                                    return
+                                item, data = payload
+                                if time.perf_counter() - started > BULK_JOB_TIMEOUT_SECONDS:
+                                    await _store_item_result(job_id, item["id"], data, {})
+                                    continue
+                                try:
+                                    balances = await enrich_balances(
+                                        data["all_wallets"],
+                                        client=balance_client,
+                                    )
+                                except Exception:
+                                    balances = {}
+                                await _store_item_result(job_id, item["id"], data, balances)
+                            finally:
+                                balance_queue.task_done()
+
+                    limits = httpx.Limits(
+                        max_connections=max(BULK_BALANCE_WORKERS, 5),
+                        max_keepalive_connections=max(BULK_BALANCE_WORKERS, 5),
+                    )
+                    async with httpx.AsyncClient(follow_redirects=True, limits=limits) as balance_client:
+                        search_workers = [
+                            asyncio.create_task(search_worker())
+                            for _ in range(BULK_WORKERS)
+                        ]
+                        balance_workers = [
+                            asyncio.create_task(balance_worker(balance_client))
+                            for _ in range(BULK_BALANCE_WORKERS)
+                        ]
+
+                        await search_queue.join()
+                        await asyncio.gather(*search_workers, return_exceptions=True)
+                        for _ in balance_workers:
+                            await balance_queue.put(None)
+                        await balance_queue.join()
+                        await asyncio.gather(*balance_workers, return_exceptions=True)
                     await _set_job_status(job_id, "done")
             finally:
                 await lock_conn.execute("SELECT pg_advisory_unlock($1, $2)", 52026, job_id)
