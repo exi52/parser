@@ -33,12 +33,20 @@ GOLDRUSH_TIMEOUT    = int(os.getenv("GOLDRUSH_TIMEOUT", "20"))
 GOLDRUSH_CONCURRENCY = max(1, int(os.getenv("GOLDRUSH_CONCURRENCY", "8")))
 GOLDRUSH_RPS = max(1, int(os.getenv("GOLDRUSH_RPS", "4")))
 GOLDRUSH_CACHE_SECONDS = int(os.getenv("GOLDRUSH_CACHE_SECONDS", "1800"))
+BALANCE_CACHE_SECONDS = int(os.getenv("BALANCE_CACHE_SECONDS", str(GOLDRUSH_CACHE_SECONDS)))
 GOLDRUSH_RETRIES = max(1, int(os.getenv("GOLDRUSH_RETRIES", "3")))
 BALANCE_MAX_TOKEN_USD = float(os.getenv("BALANCE_MAX_TOKEN_USD", "100000000000"))
+BALANCE_PROVIDER = os.getenv("BALANCE_PROVIDER", "free").strip().lower()
+FREE_RPC_TIMEOUT = int(os.getenv("FREE_RPC_TIMEOUT", "10"))
+FREE_RPC_CONCURRENCY = max(1, int(os.getenv("FREE_RPC_CONCURRENCY", "8")))
+FREE_PRICE_CACHE_SECONDS = int(os.getenv("FREE_PRICE_CACHE_SECONDS", "300"))
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet.solana.com")
 SOLANA_TIMEOUT = int(os.getenv("SOLANA_TIMEOUT", "12"))
 SOLANA_USDC_MINT = os.getenv("SOLANA_USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+SOLANA_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SOLANA_TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+FREE_SOLANA_MAX_TOKENS = max(1, int(os.getenv("FREE_SOLANA_MAX_TOKENS", "100")))
 SOLANA_SOL_PRICE_ID = os.getenv(
     "SOLANA_SOL_PRICE_ID",
     "solana:So11111111111111111111111111111111111111112",
@@ -49,11 +57,118 @@ _BALANCE_INFLIGHT: dict[str, asyncio.Task] = {}
 _BALANCE_SEMAPHORE = asyncio.Semaphore(max(GOLDRUSH_CONCURRENCY, 1))
 _GOLDRUSH_RATE_LOCK = asyncio.Lock()
 _GOLDRUSH_NEXT_REQUEST = 0.0
+_FREE_RPC_SEMAPHORE = asyncio.Semaphore(FREE_RPC_CONCURRENCY)
+_FREE_PRICE_CACHE: tuple[float, dict[str, float]] | None = None
+_FREE_PRICE_INFLIGHT: asyncio.Task | None = None
+_FREE_TOKEN_PRICE_CACHE: dict[str, tuple[float, float | None, str]] = {}
+_FREE_PRICE_SEMAPHORE = asyncio.Semaphore(2)
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
 _BULK_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
 _PLATFORM_HIT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 PLATFORM_HIT_CACHE_SECONDS = int(os.getenv("PLATFORM_HIT_CACHE_SECONDS", "3600"))
+
+
+def _rpc_urls(env_name: str, defaults: list[str]) -> list[str]:
+    raw = os.getenv(env_name, "").strip()
+    if not raw:
+        return defaults
+    return [url.strip() for url in raw.replace(";", ",").split(",") if url.strip()]
+
+
+FREE_EVM_CHAINS = {
+    "ethereum": {
+        "native": "ETH",
+        "price": "ETH",
+        "rpcs": _rpc_urls("ETH_RPC_URLS", [
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.llamarpc.com",
+        ]),
+        "tokens": [
+            ("USDC", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", 6, "USD"),
+            ("USDT", "0xdac17f958d2ee523a2206206994597c13d831ec7", 6, "USD"),
+            ("DAI", "0x6b175474e89094c44da98b954eedeac495271d0f", 18, "USD"),
+            ("WETH", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2", 18, "ETH"),
+        ],
+    },
+    "base": {
+        "native": "ETH",
+        "price": "ETH",
+        "rpcs": _rpc_urls("BASE_RPC_URLS", [
+            "https://mainnet.base.org",
+            "https://base-rpc.publicnode.com",
+        ]),
+        "tokens": [
+            ("USDC", "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", 6, "USD"),
+            ("USDbC", "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca", 6, "USD"),
+            ("WETH", "0x4200000000000000000000000000000000000006", 18, "ETH"),
+        ],
+    },
+    "arbitrum": {
+        "native": "ETH",
+        "price": "ETH",
+        "rpcs": _rpc_urls("ARBITRUM_RPC_URLS", [
+            "https://arb1.arbitrum.io/rpc",
+            "https://arbitrum-one-rpc.publicnode.com",
+        ]),
+        "tokens": [
+            ("USDC", "0xaf88d065e77c8cc2239327c5edb3a432268e5831", 6, "USD"),
+            ("USDC.e", "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8", 6, "USD"),
+            ("USDT", "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", 6, "USD"),
+            ("WETH", "0x82af49447d8a07e3bd95bd0d56f35241523fbab1", 18, "ETH"),
+        ],
+    },
+    "optimism": {
+        "native": "ETH",
+        "price": "ETH",
+        "rpcs": _rpc_urls("OPTIMISM_RPC_URLS", [
+            "https://mainnet.optimism.io",
+            "https://optimism-rpc.publicnode.com",
+        ]),
+        "tokens": [
+            ("USDC", "0x0b2c639c533813f4aa9d7837caf62653d097ff85", 6, "USD"),
+            ("USDC.e", "0x7f5c764cbc14f9669b88837ca1490cca17c31607", 6, "USD"),
+            ("USDT", "0x94b008aa00579c1307b0ef2c499ad98a8c58e58e", 6, "USD"),
+            ("WETH", "0x4200000000000000000000000000000000000006", 18, "ETH"),
+        ],
+    },
+    "polygon": {
+        "native": "POL",
+        "price": "POL",
+        "rpcs": _rpc_urls("POLYGON_RPC_URLS", [
+            "https://polygon-rpc.com",
+            "https://polygon-bor-rpc.publicnode.com",
+        ]),
+        "tokens": [
+            ("USDC", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", 6, "USD"),
+            ("USDC.e", "0x2791bca1f2de4661ed88a30c99a7a9449aa84174", 6, "USD"),
+            ("USDT", "0xc2132d05d31c914a87c6611c10748aeb04b58e8f", 6, "USD"),
+            ("DAI", "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063", 18, "USD"),
+            ("WETH", "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619", 18, "ETH"),
+        ],
+    },
+    "bsc": {
+        "native": "BNB",
+        "price": "BNB",
+        "rpcs": _rpc_urls("BSC_RPC_URLS", [
+            "https://bsc-dataseed.bnbchain.org",
+            "https://bsc-rpc.publicnode.com",
+        ]),
+        "tokens": [
+            ("USDT", "0x55d398326f99059ff775485246999027b3197955", 18, "USD"),
+            ("USDC", "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", 18, "USD"),
+            ("DAI", "0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", 18, "USD"),
+            ("WBNB", "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", 18, "BNB"),
+        ],
+    },
+}
+
+FREE_PRICE_IDS = {
+    "ETH": "coingecko:ethereum",
+    "BNB": "coingecko:binancecoin",
+    "POL": "coingecko:polygon-ecosystem-token",
+    "SOL": SOLANA_SOL_PRICE_ID,
+}
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1215,7 +1330,7 @@ def _is_solana(addr: str) -> bool:
 
 def _balance_cached(addr: str):
     item = _BALANCE_CACHE.get(addr.lower())
-    if item and time.time() - item[0] < GOLDRUSH_CACHE_SECONDS:
+    if item and time.time() - item[0] < BALANCE_CACHE_SECONDS:
         return item[1]
     return None
 
@@ -1236,6 +1351,260 @@ def _safe_usd_quote(item: dict) -> float | None:
     if not math.isfinite(quote) or quote < 0 or quote > BALANCE_MAX_TOKEN_USD:
         return None
     return quote
+
+
+async def _get_free_prices(client: httpx.AsyncClient) -> dict[str, float]:
+    global _FREE_PRICE_CACHE, _FREE_PRICE_INFLIGHT
+    now = time.time()
+    if _FREE_PRICE_CACHE and now - _FREE_PRICE_CACHE[0] < FREE_PRICE_CACHE_SECONDS:
+        return dict(_FREE_PRICE_CACHE[1])
+
+    if _FREE_PRICE_INFLIGHT is None:
+        async def fetch() -> dict[str, float]:
+            ids = list(dict.fromkeys(FREE_PRICE_IDS.values()))
+            url = "https://coins.llama.fi/prices/current/" + ",".join(ids)
+            try:
+                response = await client.get(url, timeout=FREE_RPC_TIMEOUT)
+                response.raise_for_status()
+                coins = (response.json() or {}).get("coins") or {}
+            except Exception as exc:
+                log.warning("free price fetch failed: %s", exc)
+                return {}
+
+            prices: dict[str, float] = {}
+            for symbol, coin_id in FREE_PRICE_IDS.items():
+                try:
+                    price = float((coins.get(coin_id) or {}).get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(price) and price > 0:
+                    prices[symbol] = price
+            return prices
+
+        _FREE_PRICE_INFLIGHT = asyncio.create_task(fetch())
+
+    task = _FREE_PRICE_INFLIGHT
+    try:
+        prices = await asyncio.shield(task)
+        if prices:
+            _FREE_PRICE_CACHE = (time.time(), dict(prices))
+        return dict(prices)
+    finally:
+        if task.done() and _FREE_PRICE_INFLIGHT is task:
+            _FREE_PRICE_INFLIGHT = None
+
+
+async def _get_solana_token_prices(
+    client: httpx.AsyncClient,
+    mints: list[str],
+) -> dict[str, tuple[float, str]]:
+    now = time.time()
+    result: dict[str, tuple[float, str]] = {}
+    missing: list[str] = []
+    for mint in dict.fromkeys(mints):
+        cached = _FREE_TOKEN_PRICE_CACHE.get(mint)
+        if cached and now - cached[0] < FREE_PRICE_CACHE_SECONDS:
+            if cached[1] is not None:
+                result[mint] = (cached[1], cached[2])
+            continue
+        missing.append(mint)
+
+    for start in range(0, len(missing), 30):
+        chunk = missing[start:start + 30]
+        ids = [f"solana:{mint}" for mint in chunk]
+        url = "https://coins.llama.fi/prices/current/" + ",".join(ids)
+        try:
+            async with _FREE_PRICE_SEMAPHORE:
+                response = await client.get(url, timeout=FREE_RPC_TIMEOUT)
+            response.raise_for_status()
+            coins = (response.json() or {}).get("coins") or {}
+        except Exception as exc:
+            log.debug("Solana token price fetch failed: %s", exc)
+            continue
+
+        checked_at = time.time()
+        for mint, coin_id in zip(chunk, ids):
+            coin = coins.get(coin_id) or {}
+            try:
+                price = float(coin.get("price"))
+            except (TypeError, ValueError):
+                price = None
+            if price is not None and (not math.isfinite(price) or price <= 0):
+                price = None
+            symbol = str(coin.get("symbol") or mint[:4])
+            _FREE_TOKEN_PRICE_CACHE[mint] = (checked_at, price, symbol)
+            if price is not None:
+                result[mint] = (price, symbol)
+    return result
+
+
+def _balance_of_data(address: str) -> str:
+    return "0x70a08231" + address.lower().removeprefix("0x").rjust(64, "0")
+
+
+def _hex_amount(value) -> int:
+    if not isinstance(value, str) or value in ("", "0x"):
+        return 0
+    try:
+        return int(value, 16)
+    except ValueError:
+        return 0
+
+
+def _format_usd_value(value: float) -> str:
+    if value >= 1000:
+        return f"${value:,.0f}"
+    if value >= 0.01:
+        return f"${value:,.2f}"
+    return f"${value:,.4f}"
+
+
+async def _rpc_post(client: httpx.AsyncClient, url: str, payload):
+    async with _FREE_RPC_SEMAPHORE:
+        response = await client.post(url, json=payload, timeout=FREE_RPC_TIMEOUT)
+    response.raise_for_status()
+    return response.json()
+
+
+async def _rpc_results(
+    client: httpx.AsyncClient,
+    url: str,
+    requests: list[dict],
+) -> dict[int, str]:
+    try:
+        payload = await _rpc_post(client, url, requests)
+    except Exception:
+        payload = None
+
+    if isinstance(payload, list):
+        results = {
+            int(item.get("id")): item.get("result")
+            for item in payload
+            if isinstance(item, dict) and item.get("result") is not None
+        }
+        if 1 in results:
+            return results
+
+    async def one(request: dict):
+        try:
+            item = await _rpc_post(client, url, request)
+        except Exception:
+            return request["id"], None
+        return request["id"], item.get("result") if isinstance(item, dict) else None
+
+    pairs = await asyncio.gather(*(one(request) for request in requests))
+    return {int(request_id): result for request_id, result in pairs if result is not None}
+
+
+async def _fetch_free_chain(
+    client: httpx.AsyncClient,
+    chain: str,
+    config: dict,
+    address: str,
+) -> dict | None:
+    requests = [{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBalance",
+        "params": [address, "latest"],
+    }]
+    call_data = _balance_of_data(address)
+    for index, (_, contract, _, _) in enumerate(config["tokens"], start=2):
+        requests.append({
+            "jsonrpc": "2.0",
+            "id": index,
+            "method": "eth_call",
+            "params": [{"to": contract, "data": call_data}, "latest"],
+        })
+
+    for url in config["rpcs"]:
+        results = await _rpc_results(client, url, requests)
+        if 1 not in results:
+            continue
+        tokens = []
+        for index, (symbol, _, decimals, price_key) in enumerate(config["tokens"], start=2):
+            amount = _hex_amount(results.get(index)) / (10 ** decimals)
+            if amount > 0:
+                tokens.append({"symbol": symbol, "amount": amount, "price": price_key})
+        return {
+            "chain": chain,
+            "native_symbol": config["native"],
+            "native_price": config["price"],
+            "native_amount": _hex_amount(results[1]) / 1_000_000_000_000_000_000,
+            "tokens": tokens,
+        }
+    return None
+
+
+async def fetch_free_evm_balance(client: httpx.AsyncClient, address: str) -> dict:
+    cached = _balance_cached(address)
+    if cached is not None:
+        return cached
+
+    prices_task = asyncio.create_task(_get_free_prices(client))
+    chain_results = await asyncio.gather(*(
+        _fetch_free_chain(client, chain, config, address)
+        for chain, config in FREE_EVM_CHAINS.items()
+    ))
+    prices = await prices_task
+    available = [result for result in chain_results if result is not None]
+    if not available:
+        return _blank_balance(address, "free_rpc_unavailable")
+
+    total_usd = 0.0
+    has_unpriced = False
+    positive_chains: list[str] = []
+    positions: dict[str, float] = {}
+    unpriced_positions: list[str] = []
+
+    for result in available:
+        chain_positive = False
+        native_amount = float(result["native_amount"] or 0)
+        if native_amount > 0:
+            chain_positive = True
+            symbol = result["native_symbol"]
+            price = prices.get(result["native_price"])
+            if price:
+                usd = native_amount * price
+                total_usd += usd
+                positions[symbol] = positions.get(symbol, 0.0) + usd
+            else:
+                has_unpriced = True
+                unpriced_positions.append(f"{symbol} {native_amount:,.4f}")
+
+        for token in result["tokens"]:
+            chain_positive = True
+            price = 1.0 if token["price"] == "USD" else prices.get(token["price"])
+            if price:
+                usd = token["amount"] * price
+                total_usd += usd
+                positions[token["symbol"]] = positions.get(token["symbol"], 0.0) + usd
+            else:
+                has_unpriced = True
+                unpriced_positions.append(f"{token['symbol']} {token['amount']:,.4f}")
+
+        if chain_positive:
+            positive_chains.append(result["chain"])
+
+    top = sorted(
+        (item for item in positions.items() if item[1] >= 0.01),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    top_tokens = [f"{symbol} {_format_usd_value(usd)}" for symbol, usd in top[:5]]
+    if len(top_tokens) < 5:
+        top_tokens.extend(unpriced_positions[:5 - len(top_tokens)])
+
+    any_position = bool(positions or unpriced_positions)
+    result = {
+        "address": address,
+        "balance_usd": round(total_usd, 2) if (positions or not any_position) else None,
+        "top_tokens": top_tokens,
+        "chains": positive_chains,
+        "note": "partial_price_data" if has_unpriced else "free_rpc",
+    }
+    _balance_set_cache(address, result)
+    return result
 
 
 async def _goldrush_json(
@@ -1295,18 +1664,7 @@ async def _goldrush_json(
 
 
 async def _fetch_sol_price_usd(client: httpx.AsyncClient) -> float | None:
-    try:
-        resp = await client.get(
-            f"https://coins.llama.fi/prices/current/{SOLANA_SOL_PRICE_ID}",
-            timeout=SOLANA_TIMEOUT,
-        )
-        resp.raise_for_status()
-        coin = (resp.json().get("coins") or {}).get(SOLANA_SOL_PRICE_ID) or {}
-        price = coin.get("price")
-        return float(price) if isinstance(price, (int, float)) else None
-    except Exception as exc:
-        log.debug("solana price fetch failed: %s", exc)
-        return None
+    return (await _get_free_prices(client)).get("SOL")
 
 
 async def _solana_rpc(client: httpx.AsyncClient, method: str, params: list) -> dict:
@@ -1375,57 +1733,94 @@ async def fetch_solana_balance(client: httpx.AsyncClient, address: str) -> dict:
     if not _is_solana(address):
         return _blank_balance(address, "non_solana")
 
-    goldrush_result = await fetch_solana_goldrush_balance(client, address)
-    if goldrush_result is not None and goldrush_result.get("note") not in {
-        "goldrush_solana_rate_limited",
-        "goldrush_solana_timeout",
-    }:
-        return goldrush_result
+    if BALANCE_PROVIDER in ("goldrush", "auto"):
+        goldrush_result = await fetch_solana_goldrush_balance(client, address)
+        if goldrush_result is not None and goldrush_result.get("note") not in {
+            "goldrush_solana_rate_limited",
+            "goldrush_solana_timeout",
+        }:
+            return goldrush_result
 
-    try:
-        balance_result, usdc_result, sol_price = await asyncio.gather(
-            _solana_rpc(client, "getBalance", [address, {"commitment": "confirmed"}]),
-            _solana_rpc(client, "getTokenAccountsByOwner", [
-                address,
-                {"mint": SOLANA_USDC_MINT},
-                {"encoding": "jsonParsed"},
-            ]),
-            _fetch_sol_price_usd(client),
-        )
-    except httpx.TimeoutException:
-        return _blank_balance(address, "solana_timeout")
-    except Exception as exc:
-        return _blank_balance(address, f"solana_error:{str(exc)[:60]}")
+    raw = await asyncio.gather(
+        _solana_rpc(client, "getBalance", [address, {"commitment": "confirmed"}]),
+        _solana_rpc(client, "getTokenAccountsByOwner", [
+            address,
+            {"programId": SOLANA_TOKEN_PROGRAM},
+            {"encoding": "jsonParsed"},
+        ]),
+        _solana_rpc(client, "getTokenAccountsByOwner", [
+            address,
+            {"programId": SOLANA_TOKEN_2022_PROGRAM},
+            {"encoding": "jsonParsed"},
+        ]),
+        _fetch_sol_price_usd(client),
+        return_exceptions=True,
+    )
+    balance_result, token_result, token_2022_result, sol_price = raw
+    if isinstance(balance_result, Exception):
+        return _blank_balance(address, f"solana_error:{str(balance_result)[:60]}")
+    if isinstance(sol_price, Exception):
+        sol_price = None
 
     lamports = int(balance_result.get("value") or 0)
     sol_amount = lamports / 1_000_000_000
-    usdc_amount = 0.0
-    for account in usdc_result.get("value") or []:
-        parsed = (((account.get("account") or {}).get("data") or {}).get("parsed") or {})
-        token_amount = ((parsed.get("info") or {}).get("tokenAmount") or {})
-        try:
-            usdc_amount += float(token_amount.get("uiAmount") or 0)
-        except (TypeError, ValueError):
+    token_amounts: dict[str, float] = {}
+    for source in (token_result, token_2022_result):
+        if not isinstance(source, dict):
             continue
+        for account in source.get("value") or []:
+            parsed = (((account.get("account") or {}).get("data") or {}).get("parsed") or {})
+            info = parsed.get("info") or {}
+            mint = info.get("mint")
+            token_amount = info.get("tokenAmount") or {}
+            try:
+                amount = float(token_amount.get("uiAmountString") or token_amount.get("uiAmount") or 0)
+            except (TypeError, ValueError):
+                continue
+            if mint and amount > 0:
+                token_amounts[mint] = token_amounts.get(mint, 0.0) + amount
 
-    balance_usd = None
-    if sol_price is not None:
-        balance_usd = round((sol_amount * sol_price) + usdc_amount, 2)
-    elif usdc_amount:
-        balance_usd = round(usdc_amount, 2)
+    selected_mints = sorted(token_amounts, key=token_amounts.get, reverse=True)[:FREE_SOLANA_MAX_TOKENS]
+    price_data = await _get_solana_token_prices(
+        client,
+        [mint for mint in selected_mints if mint != SOLANA_USDC_MINT],
+    )
 
-    top_tokens = []
-    if sol_amount:
-        top_tokens.append(f"SOL {sol_amount:,.4f}")
-    if usdc_amount:
-        top_tokens.append(f"USDC ${usdc_amount:,.2f}")
+    positions: list[tuple[str, float]] = []
+    total_usd = 0.0
+    if sol_amount > 0 and sol_price:
+        sol_usd = sol_amount * sol_price
+        total_usd += sol_usd
+        positions.append(("SOL", sol_usd))
+    for mint in selected_mints:
+        amount = token_amounts[mint]
+        if mint == SOLANA_USDC_MINT:
+            price, symbol = 1.0, "USDC"
+        else:
+            priced = price_data.get(mint)
+            if not priced:
+                continue
+            price, symbol = priced
+        usd = amount * price
+        if not math.isfinite(usd) or usd <= 0 or usd > BALANCE_MAX_TOKEN_USD:
+            continue
+        total_usd += usd
+        positions.append((symbol, usd))
+
+    positions.sort(key=lambda item: item[1], reverse=True)
+    top_tokens = [
+        f"{symbol} {_format_usd_value(usd)}"
+        for symbol, usd in positions[:5] if usd >= 0.01
+    ]
+    has_assets = sol_amount > 0 or bool(token_amounts)
+    balance_usd = round(total_usd, 2) if positions or not has_assets else None
 
     result = {
         "address": address,
         "balance_usd": balance_usd,
         "top_tokens": top_tokens,
         "chains": ["solana"],
-        "note": "" if top_tokens else "empty_solana",
+        "note": "free_rpc" if has_assets else "empty_solana",
     }
     _balance_set_cache(address, result)
     return result
@@ -1437,8 +1832,8 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
         if _is_solana(address):
             return await fetch_solana_balance(client, address)
         return _blank_balance(address, "unsupported_chain")
-    if not GOLDRUSH_API_KEY:
-        return _blank_balance(address, "no_goldrush_api_key")
+    if BALANCE_PROVIDER == "free" or not GOLDRUSH_API_KEY:
+        return await fetch_free_evm_balance(client, address)
 
     cached = _balance_cached(address)
     if cached is not None:
