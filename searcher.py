@@ -6,6 +6,7 @@ Crypto OSINT — searcher.py
 import asyncio
 import copy
 import logging
+import math
 import os
 import re
 import time
@@ -31,6 +32,8 @@ GOLDRUSH_CHAINS     = os.getenv(
 GOLDRUSH_TIMEOUT    = int(os.getenv("GOLDRUSH_TIMEOUT", "20"))
 GOLDRUSH_CONCURRENCY = int(os.getenv("GOLDRUSH_CONCURRENCY", "5"))
 GOLDRUSH_CACHE_SECONDS = int(os.getenv("GOLDRUSH_CACHE_SECONDS", "1800"))
+BALANCE_MAX_TOKEN_USD = float(os.getenv("BALANCE_MAX_TOKEN_USD", "100000000000"))
+BALANCE_MAX_WALLET_USD = float(os.getenv("BALANCE_MAX_WALLET_USD", "500000000000"))
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet.solana.com")
 SOLANA_TIMEOUT = int(os.getenv("SOLANA_TIMEOUT", "12"))
@@ -43,6 +46,7 @@ SOLANA_SOL_PRICE_ID = os.getenv(
 _BALANCE_CACHE: dict[str, tuple[float, dict]] = {}
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
+_BULK_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
 _PLATFORM_HIT_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 PLATFORM_HIT_CACHE_SECONDS = int(os.getenv("PLATFORM_HIT_CACHE_SECONDS", "3600"))
 
@@ -51,6 +55,35 @@ HEADERS = {
     "Accept": "application/json, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+
+class _TrackedClient:
+    """Tracks whether a source was reachable even when a checker handles exceptions itself."""
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.attempts = 0
+        self.available_responses = 0
+
+    async def _request(self, method: str, *args, **kwargs):
+        self.attempts += 1
+        try:
+            response = await getattr(self.client, method)(*args, **kwargs)
+        except Exception:
+            raise
+        if response.status_code < 400 or response.status_code == 404:
+            self.available_responses += 1
+        return response
+
+    async def get(self, *args, **kwargs):
+        return await self._request("get", *args, **kwargs)
+
+    async def post(self, *args, **kwargs):
+        return await self._request("post", *args, **kwargs)
+
+    @property
+    def unavailable(self) -> bool:
+        return self.attempts > 0 and self.available_responses == 0
 
 
 def web3bio_headers() -> dict:
@@ -382,14 +415,37 @@ async def reverse_lookup(address: str) -> dict:
     address = address.strip().lower()
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=12) as client:
         raw = await asyncio.gather(
-            _rev_ens(client, address),
-            _rev_farcaster(client, address),
-            _rev_lens(client, address),
-            _rev_web3bio(client, address),
+            _run_reverse_source(_rev_ens, client, address),
+            _run_reverse_source(_rev_farcaster, client, address),
+            _run_reverse_source(_rev_lens, client, address),
+            _run_reverse_source(_rev_web3bio, client, address),
             return_exceptions=True
         )
     results = [r for r in raw if r and not isinstance(r, Exception) and r.get("found")]
-    return {"address": address, "found_count": len(results), "results": results}
+    errors = [
+        {"platform": r.get("platform", "reverse"), "error": r.get("error")}
+        for r in raw if isinstance(r, dict) and r.get("error")
+    ]
+    errors.extend(
+        {"platform": "reverse", "error": str(r)[:120]}
+        for r in raw if isinstance(r, Exception)
+    )
+    return {
+        "address": address,
+        "found_count": len(results),
+        "results": results,
+        "diagnostics": {"platforms_checked": len(raw), "errors": errors},
+    }
+
+
+async def _run_reverse_source(fn, client, address: str) -> dict:
+    tracked = _TrackedClient(client)
+    result = await fn(tracked, address)
+    if not result.get("found") and tracked.unavailable:
+        result = dict(result)
+        result["platform"] = result.get("platform") or fn.__name__.replace("_rev_", "")
+        result["error"] = "source_unavailable"
+    return result
 
 
 async def _rev_ens(client, address):
@@ -854,6 +910,30 @@ def _set_cached(username: str, data: dict):
             _SEARCH_CACHE.pop(key, None)
 
 
+def _get_bulk_cached(username: str) -> dict | None:
+    entry = _BULK_SEARCH_CACHE.get(_cache_key(username))
+    if not entry:
+        return None
+    created, data = entry
+    if SEARCH_CACHE_SECONDS <= 0 or time.time() - created > SEARCH_CACHE_SECONDS:
+        _BULK_SEARCH_CACHE.pop(_cache_key(username), None)
+        return None
+    cached = copy.deepcopy(data)
+    cached["cache_hit"] = True
+    cached["bulk_mode"] = True
+    return cached
+
+
+def _set_bulk_cached(username: str, data: dict):
+    if SEARCH_CACHE_SECONDS <= 0:
+        return
+    _BULK_SEARCH_CACHE[_cache_key(username)] = (time.time(), copy.deepcopy(data))
+    if len(_BULK_SEARCH_CACHE) > 512:
+        oldest = sorted(_BULK_SEARCH_CACHE.items(), key=lambda item: item[1][0])[:128]
+        for key, _ in oldest:
+            _BULK_SEARCH_CACHE.pop(key, None)
+
+
 def _result_identity(result: dict) -> tuple[str, str]:
     return (
         str(result.get("platform") or "").lower(),
@@ -958,13 +1038,16 @@ def _get_platform_hit(fn_name: str, username: str, variants: dict) -> dict | Non
 async def _run_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
     started = time.perf_counter()
     timeout = platform_timeout or PLATFORM_TIMEOUT_SECONDS
+    tracked = _TrackedClient(client)
     try:
         result = await asyncio.wait_for(
-            fn(client, username, variants),
+            fn(tracked, username, variants),
             timeout=timeout,
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         cleaned = _clean_result(result, username, elapsed_ms)
+        if not cleaned.get("found") and tracked.unavailable:
+            cleaned["error"] = "source_unavailable"
         if not cleaned.get("found"):
             cached_hit = _get_platform_hit(fn.__name__, username, variants)
             if cached_hit:
@@ -1090,6 +1173,9 @@ async def run_bulk_search(username: str, stop_after_first_wallet: bool = True) -
     if cached:
         cached["bulk_mode"] = True
         return cached
+    cached = _get_bulk_cached(username)
+    if cached:
+        return cached
 
     variants = get_variants(username)
     started = time.perf_counter()
@@ -1108,7 +1194,7 @@ async def run_bulk_search(username: str, stop_after_first_wallet: bool = True) -
     data = _build_search_response(username, variants, results, started)
     data["bulk_mode"] = True
     if data["found_count"] > 0:
-        _set_cached(username, data)
+        _set_bulk_cached(username, data)
     return data
 
 
@@ -1135,6 +1221,18 @@ def _balance_set_cache(addr: str, data: dict):
 
 def _blank_balance(addr: str, note: str = "") -> dict:
     return {"address": addr, "balance_usd": None, "top_tokens": [], "chains": [], "note": note}
+
+
+def _safe_usd_quote(item: dict) -> float | None:
+    if item.get("is_spam") is True or item.get("spam") is True:
+        return None
+    try:
+        quote = float(item.get("quote"))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(quote) or quote < 0 or quote > BALANCE_MAX_TOKEN_USD:
+        return None
+    return quote
 
 
 async def _fetch_sol_price_usd(client: httpx.AsyncClient) -> float | None:
@@ -1190,13 +1288,17 @@ async def fetch_solana_goldrush_balance(client: httpx.AsyncClient, address: str)
     for item in items:
         if not isinstance(item, dict):
             continue
-        quote = item.get("quote")
+        quote = _safe_usd_quote(item)
         sym = item.get("contract_ticker_symbol") or item.get("contract_name") or "?"
         pretty = item.get("pretty_quote")
-        if isinstance(quote, (int, float)):
-            total += float(quote)
+        if quote is not None:
+            total += quote
             if quote >= 1:
-                tokens.append((str(sym), float(quote), str(pretty or "")))
+                tokens.append((str(sym), quote, str(pretty or "")))
+
+    if total > BALANCE_MAX_WALLET_USD:
+        log.warning("discarding anomalous Solana balance address=%s total=%s", address, total)
+        return _blank_balance(address, "anomalous_balance")
 
     tokens.sort(key=lambda token: token[1], reverse=True)
     result = {
@@ -1311,15 +1413,19 @@ async def fetch_wallet_balance(client: httpx.AsyncClient, address: str) -> dict:
     for it in items:
         if not isinstance(it, dict):
             continue
-        quote = it.get("quote")
-        if isinstance(quote, (int, float)):
+        quote = _safe_usd_quote(it)
+        if quote is not None:
             total += quote
             sym = it.get("contract_ticker_symbol") or "?"
             if quote >= 1:
-                tokens.append((sym, float(quote)))
+                tokens.append((sym, quote))
         chain = it.get("chain_name")
         if chain and chain not in chains:
             chains.append(chain)
+
+    if total > BALANCE_MAX_WALLET_USD:
+        log.warning("discarding anomalous EVM balance address=%s total=%s", address, total)
+        return _blank_balance(address, "anomalous_balance")
 
     tokens.sort(key=lambda t: t[1], reverse=True)
     result = {

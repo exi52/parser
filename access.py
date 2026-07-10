@@ -340,16 +340,19 @@ async def confirm_payment(user_id: int) -> dict | None:
                 return None
 
             days = payment["subscription_days"] or 30
-            expires = datetime.now() + timedelta(days=days)
-            await conn.execute("""
+            expires = await conn.fetchval("""
                 INSERT INTO users (user_id, username, active, ref_code, plan_id, subscription_expires, blocked)
-                VALUES ($1, $2, TRUE, $3, $4, $5, FALSE)
+                VALUES ($1, $2, TRUE, $3, $4, NOW() + ($5::int * INTERVAL '1 day'), FALSE)
                 ON CONFLICT (user_id) DO UPDATE
                 SET active=TRUE,
                     plan_id=$4,
-                    subscription_expires=$5,
+                    subscription_expires=GREATEST(
+                        COALESCE(users.subscription_expires, NOW()),
+                        NOW()
+                    ) + ($5::int * INTERVAL '1 day'),
                     blocked=FALSE
-            """, user_id, str(user_id), _gen_code("REF", 8), payment["plan_id"], expires)
+                RETURNING subscription_expires
+            """, user_id, str(user_id), _gen_code("REF", 8), payment["plan_id"], days)
             await conn.execute("""
                 UPDATE payments
                 SET confirmed=TRUE, status='confirmed', updated=NOW()
@@ -365,21 +368,24 @@ async def grant_subscription(user_id: int, days: int, plan_id: str | None = None
     if days <= 0:
         raise ValueError("days must be positive")
 
-    expires = datetime.now() + timedelta(days=days)
     plan_id = plan_id or f"manual_{days}d"
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("""
+            expires = await conn.fetchval("""
                 INSERT INTO users (user_id, username, active, ref_code, plan_id, subscription_expires, blocked)
-                VALUES ($1, $2, TRUE, $3, $4, $5, FALSE)
+                VALUES ($1, $2, TRUE, $3, $4, NOW() + ($5::int * INTERVAL '1 day'), FALSE)
                 ON CONFLICT (user_id) DO UPDATE
                 SET active=TRUE,
                     plan_id=$4,
-                    subscription_expires=$5,
+                    subscription_expires=GREATEST(
+                        COALESCE(users.subscription_expires, NOW()),
+                        NOW()
+                    ) + ($5::int * INTERVAL '1 day'),
                     blocked=FALSE
-            """, user_id, str(user_id), _gen_code("REF", 8), plan_id, expires)
+                RETURNING subscription_expires
+            """, user_id, str(user_id), _gen_code("REF", 8), plan_id, days)
 
     return {"user_id": user_id, "expires": expires, "days": days, "plan_id": plan_id}
 

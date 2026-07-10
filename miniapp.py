@@ -14,9 +14,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl
-from collections import defaultdict, deque
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -32,7 +31,7 @@ from bulk_service import (
     parse_bulk_usernames,
     process_bulk_job,
 )
-from database import get_pool, init_db
+from database import consume_rate_limit, get_pool, init_db
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MINIAPP_DEV_USER_ID = os.getenv("MINIAPP_DEV_USER_ID", "")
@@ -55,8 +54,6 @@ BULK_USER_IDS = {
 
 BASE_DIR = Path(__file__).resolve().parent
 WEBAPP_DIR = BASE_DIR / "webapp"
-_rate_buckets: dict[tuple[int, str], deque[float]] = defaultdict(deque)
-
 app = FastAPI(title="Crypto OSINT Bulk Mini App")
 
 
@@ -109,7 +106,8 @@ def verify_telegram_init_data(init_data: str) -> dict:
         raise HTTPException(status_code=401, detail="Missing Telegram hash")
 
     auth_date = int(pairs.get("auth_date", "0") or "0")
-    if auth_date and time.time() - auth_date > 86400:
+    now = time.time()
+    if auth_date <= 0 or auth_date > now + 60 or now - auth_date > 86400:
         raise HTTPException(status_code=401, detail="Telegram auth expired")
 
     data_check = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
@@ -129,9 +127,8 @@ def verify_telegram_init_data(init_data: str) -> dict:
 
 async def current_user(
     x_telegram_init_data: str | None = Header(default=None),
-    tg: str | None = Query(default=None),
 ):
-    init_data = x_telegram_init_data or tg
+    init_data = x_telegram_init_data
     if init_data:
         tg_user = verify_telegram_init_data(init_data)
         user_id = int(tg_user["id"])
@@ -151,21 +148,20 @@ def can_use_bulk(user_id: int, credits_active: bool) -> bool:
     return user_id in ADMIN_IDS or user_id in BULK_USER_IDS or credits_active
 
 
-def check_rate_limit(user_id: int, bucket: str, max_requests: int, window_seconds: int | None = None):
-    now = time.time()
-    window = window_seconds or MINIAPP_RATE_LIMIT_WINDOW
-    key = (user_id, bucket)
-    q = _rate_buckets[key]
-    while q and now - q[0] > window:
-        q.popleft()
-    if len(q) >= max_requests:
+async def check_rate_limit(user_id: int, bucket: str, max_requests: int, window_seconds: int | None = None):
+    allowed = await consume_rate_limit(
+        user_id,
+        f"miniapp:{bucket}",
+        max_requests,
+        window_seconds or MINIAPP_RATE_LIMIT_WINDOW,
+    )
+    if not allowed:
         raise HTTPException(status_code=429, detail="Too many requests")
-    q.append(now)
 
 
 @app.get("/api/me")
 async def api_me(user=Depends(current_user)):
-    check_rate_limit(user["id"], "me", MINIAPP_RATE_LIMIT_MAX)
+    await check_rate_limit(user["id"], "me", MINIAPP_RATE_LIMIT_MAX)
     status = await get_bulk_status(user["id"])
     return {
         "user": user,
@@ -180,7 +176,7 @@ async def api_me(user=Depends(current_user)):
 
 @app.get("/api/jobs")
 async def api_jobs(user=Depends(current_user)):
-    check_rate_limit(user["id"], "jobs", MINIAPP_RATE_LIMIT_MAX)
+    await check_rate_limit(user["id"], "jobs", MINIAPP_RATE_LIMIT_MAX)
     return {"jobs": _clean(await list_jobs(user["id"]))}
 
 
@@ -190,8 +186,8 @@ async def api_create_job(
     file: UploadFile = File(...),
     user=Depends(current_user),
 ):
-    check_rate_limit(user["id"], "upload", MINIAPP_UPLOAD_RATE_LIMIT_MAX)
-    check_rate_limit(user["id"], "upload_cooldown", 1, MINIAPP_UPLOAD_COOLDOWN_SECONDS)
+    await check_rate_limit(user["id"], "upload", MINIAPP_UPLOAD_RATE_LIMIT_MAX)
+    await check_rate_limit(user["id"], "upload_cooldown", 1, MINIAPP_UPLOAD_COOLDOWN_SECONDS)
     filename = file.filename or "users.txt"
     if not filename.lower().endswith((".txt", ".csv")):
         raise HTTPException(status_code=400, detail="Only .txt and .csv files are supported")
@@ -239,7 +235,7 @@ async def api_create_job(
 
 @app.get("/api/jobs/{job_id}")
 async def api_job(job_id: int, user=Depends(current_user)):
-    check_rate_limit(user["id"], "job", MINIAPP_RATE_LIMIT_MAX)
+    await check_rate_limit(user["id"], "job", MINIAPP_RATE_LIMIT_MAX)
     items = await list_job_items(user["id"], job_id, limit=1, offset=0)
     if not items:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -256,7 +252,7 @@ async def api_job_items(
     sort: str = "",
     user=Depends(current_user),
 ):
-    check_rate_limit(user["id"], "items", MINIAPP_RATE_LIMIT_MAX)
+    await check_rate_limit(user["id"], "items", MINIAPP_RATE_LIMIT_MAX)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
     sort = sort if sort in ("", "balance_desc") else ""
@@ -287,7 +283,7 @@ async def api_job_items(
 
 @app.get("/api/jobs/{job_id}/export.csv")
 async def api_export_csv(job_id: int, user=Depends(current_user)):
-    check_rate_limit(user["id"], "export", 20)
+    await check_rate_limit(user["id"], "export", 20)
     data = await export_job_csv(user["id"], job_id)
     if data is None:
         raise HTTPException(status_code=404, detail="Job not found")

@@ -180,7 +180,7 @@ async def list_job_items(
     if sort == "balance_desc":
         order_sql = """
             COALESCE((
-                SELECT MAX((balance.value->>'balance_usd')::numeric)
+                SELECT SUM((balance.value->>'balance_usd')::numeric)
                 FROM jsonb_each(balances) AS balance(key, value)
                 WHERE jsonb_typeof(balance.value) = 'object'
                   AND (balance.value->>'balance_usd') ~ '^-?[0-9]+(\\.[0-9]+)?$'
@@ -236,7 +236,7 @@ async def _store_item_result(job_id: int, item_id: int, data: dict[str, Any], ba
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("""
+            updated = await conn.fetchval("""
                 UPDATE bulk_items
                 SET status='done',
                     wallets=$3::jsonb,
@@ -246,7 +246,8 @@ async def _store_item_result(job_id: int, item_id: int, data: dict[str, Any], ba
                     result=$7::jsonb,
                     elapsed_ms=$8,
                     updated_at=NOW()
-                WHERE id=$1 AND job_id=$2
+                WHERE id=$1 AND job_id=$2 AND status='pending'
+                RETURNING 1
             """,
                 item_id,
                 job_id,
@@ -257,28 +258,31 @@ async def _store_item_result(job_id: int, item_id: int, data: dict[str, Any], ba
                 json.dumps(data),
                 int(elapsed_ms or 0),
             )
-            await conn.execute("""
-                UPDATE bulk_jobs
-                SET processed_count = processed_count + 1,
-                    found_count = found_count + CASE WHEN $2 THEN 1 ELSE 0 END
-                WHERE id=$1
-            """, job_id, bool(wallets))
+            if updated:
+                await conn.execute("""
+                    UPDATE bulk_jobs
+                    SET processed_count = processed_count + 1,
+                        found_count = found_count + CASE WHEN $2 THEN 1 ELSE 0 END
+                    WHERE id=$1
+                """, job_id, bool(wallets))
 
 
 async def _store_item_error(job_id: int, item_id: int, error: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("""
+            updated = await conn.fetchval("""
                 UPDATE bulk_items
                 SET status='failed', error=$3, updated_at=NOW()
-                WHERE id=$1 AND job_id=$2
+                WHERE id=$1 AND job_id=$2 AND status='pending'
+                RETURNING 1
             """, item_id, job_id, error[:300])
-            await conn.execute("""
-                UPDATE bulk_jobs
-                SET processed_count = processed_count + 1
-                WHERE id=$1
-            """, job_id)
+            if updated:
+                await conn.execute("""
+                    UPDATE bulk_jobs
+                    SET processed_count = processed_count + 1
+                    WHERE id=$1
+                """, job_id)
 
 
 async def process_bulk_job(job_id: int):
@@ -287,48 +291,63 @@ async def process_bulk_job(job_id: int):
     _active_jobs.add(job_id)
     started = time.perf_counter()
     try:
-        async with _job_slots:
-            await _set_job_status(job_id, "running")
-            pool = await get_pool()
-            async with pool.acquire() as conn:
-                rows = await conn.fetch("""
-                    SELECT id, username
-                    FROM bulk_items
-                    WHERE job_id=$1 AND status='pending'
-                    ORDER BY id ASC
-                """, job_id)
+        pool = await get_pool()
+        async with pool.acquire() as lock_conn:
+            lock_acquired = await lock_conn.fetchval(
+                "SELECT pg_try_advisory_lock($1, $2)", 52026, job_id
+            )
+            if not lock_acquired:
+                return
+            try:
+                status = await lock_conn.fetchval(
+                    "SELECT status FROM bulk_jobs WHERE id=$1", job_id
+                )
+                if status not in ("queued", "running"):
+                    return
 
-            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-            for row in rows:
-                await queue.put(dict(row))
-            for _ in range(BULK_WORKERS):
-                await queue.put(None)
+                async with _job_slots:
+                    await _set_job_status(job_id, "running")
+                    async with pool.acquire() as conn:
+                        rows = await conn.fetch("""
+                            SELECT id, username
+                            FROM bulk_items
+                            WHERE job_id=$1 AND status='pending'
+                            ORDER BY id ASC
+                        """, job_id)
 
-            async def worker():
-                while True:
-                    item = await queue.get()
-                    try:
-                        if item is None:
-                            return
-                        if time.perf_counter() - started > BULK_JOB_TIMEOUT_SECONDS:
-                            await _store_item_error(job_id, item["id"], "job timeout")
-                            continue
+                    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+                    for row in rows:
+                        await queue.put(dict(row))
+                    for _ in range(BULK_WORKERS):
+                        await queue.put(None)
 
-                        data = await run_bulk_search(item["username"])
-                        balances = {}
-                        if BULK_INCLUDE_BALANCES and data.get("all_wallets"):
-                            balances = await enrich_balances(data["all_wallets"])
-                        await _store_item_result(job_id, item["id"], data, balances)
-                    except Exception as exc:
-                        if item is not None:
-                            await _store_item_error(job_id, item["id"], str(exc))
-                    finally:
-                        queue.task_done()
+                    async def worker():
+                        while True:
+                            item = await queue.get()
+                            try:
+                                if item is None:
+                                    return
+                                if time.perf_counter() - started > BULK_JOB_TIMEOUT_SECONDS:
+                                    await _store_item_error(job_id, item["id"], "job timeout")
+                                    continue
 
-            workers = [asyncio.create_task(worker()) for _ in range(BULK_WORKERS)]
-            await queue.join()
-            await asyncio.gather(*workers, return_exceptions=True)
-            await _set_job_status(job_id, "done")
+                                data = await run_bulk_search(item["username"])
+                                balances = {}
+                                if BULK_INCLUDE_BALANCES and data.get("all_wallets"):
+                                    balances = await enrich_balances(data["all_wallets"])
+                                await _store_item_result(job_id, item["id"], data, balances)
+                            except Exception as exc:
+                                if item is not None:
+                                    await _store_item_error(job_id, item["id"], str(exc))
+                            finally:
+                                queue.task_done()
+
+                    workers = [asyncio.create_task(worker()) for _ in range(BULK_WORKERS)]
+                    await queue.join()
+                    await asyncio.gather(*workers, return_exceptions=True)
+                    await _set_job_status(job_id, "done")
+            finally:
+                await lock_conn.execute("SELECT pg_advisory_unlock($1, $2)", 52026, job_id)
     except Exception as exc:
         await _set_job_status(job_id, "failed", str(exc)[:300])
     finally:

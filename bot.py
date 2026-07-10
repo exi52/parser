@@ -2,15 +2,14 @@
 Crypto OSINT Bot — тарифы, хеш транзы, поддержка
 """
 
-import asyncio, logging, os, time
-from collections import defaultdict
+import asyncio, logging, os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (Application, CommandHandler, MessageHandler,
                            CallbackQueryHandler, filters, ContextTypes)
 from telegram.constants import ParseMode
 
 from searcher import extract_username, run_search, reverse_lookup, is_eth_address, get_variants, enrich_balances, GOLDRUSH_API_KEY
-from database import init_db, close_pool, get_pool
+from database import consume_rate_limit, init_db, close_pool, get_pool
 from access  import (
     get_or_create_user, check_access, use_search, get_user_stats,
     activate_ref, get_referrals, list_all_refs,
@@ -36,18 +35,16 @@ MINIAPP_URL = os.getenv("MINIAPP_URL", "").strip()
 
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "5"))
-_user_requests: dict[int, list[float]] = defaultdict(list)
+async def check_rate_limit(user_id: int) -> bool:
+    """Shared rate limit that works across Railway replicas and restarts."""
+    return await consume_rate_limit(user_id, "bot:search", RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
 
 
-def check_rate_limit(user_id: int) -> bool:
-    """True = разрешено, False = лимит превышен."""
-    now = time.time()
-    reqs = [t for t in _user_requests[user_id] if now - t < RATE_LIMIT_WINDOW]
-    _user_requests[user_id] = reqs
-    if len(reqs) >= RATE_LIMIT_MAX:
-        return False
-    reqs.append(now)
-    return True
+def search_failed_technically(data: dict) -> bool:
+    diagnostics = data.get("diagnostics") or {}
+    checked = int(diagnostics.get("platforms_checked") or 0)
+    errors = diagnostics.get("errors") or []
+    return not data.get("found_count") and (checked <= 0 or len(errors) >= checked)
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
@@ -823,7 +820,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Проверка доступа ──────────────────────────────────────────────────────
     if not is_admin(uid):
         # Rate limit — не больше 5 поисков в минуту
-        if not check_rate_limit(uid):
+        if not await check_rate_limit(uid):
             await update.message.reply_text(
                 "⏳ Слишком много запросов. Подожди минуту и попробуй снова.",
                 parse_mode=ParseMode.HTML)
@@ -852,11 +849,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML)
         try:
             data = await reverse_lookup(raw)
+            technical_failure = search_failed_technically(data)
             text = await fmt_reverse(data)
+            if technical_failure:
+                text += "\n\n<i>Источники временно недоступны — поиск не списан.</i>"
             if len(text) > 4000:
                 text = text[:3900] + "\n<i>...обрезано</i>"
             await msg.edit_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            if not is_admin(uid):
+            if not is_admin(uid) and not technical_failure:
                 await use_search(uid)
         except Exception as e:
             log.error(e, exc_info=True)
@@ -878,16 +878,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML)
     try:
         data = await run_search(username)
-        if not is_admin(uid):
-            await use_search(uid)
+        technical_failure = search_failed_technically(data)
         balances = await enrich_balances(data["all_wallets"]) if data.get("all_wallets") else {}
         text    = await fmt_search(data, balances)
+        if technical_failure:
+            text += "\n\n<i>Источники временно недоступны — поиск не списан.</i>"
         buttons = wallet_buttons(data["all_wallets"])
         if len(text) > 4000:
             text = text[:3900] + "\n<i>...обрезано</i>"
         await msg.edit_text(
             text, parse_mode=ParseMode.HTML,
             reply_markup=buttons, disable_web_page_preview=True)
+        if not is_admin(uid) and not technical_failure:
+            await use_search(uid)
     except Exception as e:
         log.error(e, exc_info=True)
         await msg.edit_text(f"❌ Ошибка: <code>{esc(str(e)[:200])}</code>", parse_mode=ParseMode.HTML)

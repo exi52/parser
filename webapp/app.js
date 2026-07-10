@@ -58,6 +58,29 @@ async function api(path, options = {}) {
   return res.json();
 }
 
+async function downloadExport(jobId) {
+  const headers = new Headers();
+  if (initData) headers.set("X-Telegram-Init-Data", initData);
+  const res = await fetch(`/api/jobs/${jobId}/export.csv`, { headers });
+  if (!res.ok) {
+    let message = `HTTP ${res.status}`;
+    try {
+      const data = await res.json();
+      message = data.detail || message;
+    } catch (_) {}
+    throw new Error(message);
+  }
+
+  const blobUrl = URL.createObjectURL(await res.blob());
+  const anchor = document.createElement("a");
+  anchor.href = blobUrl;
+  anchor.download = `bulk_job_${jobId}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+}
+
 function esc(value) {
   return String(value == null ? "" : value)
     .replaceAll("&", "&amp;")
@@ -190,10 +213,11 @@ function renderJob(job) {
   els.jobTitle.textContent = `Run #${job.id}`;
   els.jobMeta.textContent = `${compact(job.processed_count)} of ${compact(job.total_count)} checked · ${compact(job.found_count)} found · ${pct}%`;
   els.progressBar.style.width = `${pct}%`;
-  const exportUrl = `/api/jobs/${job.id}/export.csv${initData ? `?tg=${encodeURIComponent(initData)}` : ""}`;
-  els.exportLink.href = exportUrl;
+  els.exportLink.href = "#";
+  els.exportLink.dataset.jobId = String(job.id);
   els.exportLink.classList.remove("disabled");
-  els.tableExportLink.href = exportUrl;
+  els.tableExportLink.href = "#";
+  els.tableExportLink.dataset.jobId = String(job.id);
   els.tableExportLink.classList.remove("disabled");
   updateMetrics(job);
 }
@@ -357,6 +381,18 @@ els.sortSelect.addEventListener("change", async () => {
   state.sort = els.sortSelect.value;
   state.offset = 0;
   await loadItems();
+});
+
+[els.exportLink, els.tableExportLink].forEach(link => {
+  link.addEventListener("click", async event => {
+    event.preventDefault();
+    if (link.classList.contains("disabled") || !link.dataset.jobId) return;
+    try {
+      await downloadExport(Number(link.dataset.jobId));
+    } catch (err) {
+      setUploadStatus(err.message, "error");
+    }
+  });
 });
 
 let searchTimer;

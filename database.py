@@ -29,6 +29,27 @@ async def get_pool() -> asyncpg.Pool:
     return await init_pool()
 
 
+async def consume_rate_limit(user_id: int, bucket: str, max_requests: int, window_seconds: int) -> bool:
+    """Atomically consume one fixed-window rate-limit slot shared by all replicas."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("""
+            INSERT INTO api_rate_limits (user_id, bucket, window_start, request_count)
+            VALUES ($1, $2, NOW(), 1)
+            ON CONFLICT (user_id, bucket) DO UPDATE
+            SET request_count = CASE
+                    WHEN api_rate_limits.window_start <= NOW() - ($3::int * INTERVAL '1 second') THEN 1
+                    ELSE api_rate_limits.request_count + 1
+                END,
+                window_start = CASE
+                    WHEN api_rate_limits.window_start <= NOW() - ($3::int * INTERVAL '1 second') THEN NOW()
+                    ELSE api_rate_limits.window_start
+                END
+            RETURNING request_count
+        """, user_id, bucket, max(1, window_seconds))
+    return int(count or 0) <= max(1, max_requests)
+
+
 async def close_pool():
     global _pool
     if _pool is not None:
@@ -110,6 +131,15 @@ async def init_db():
                     elapsed_ms  INTEGER DEFAULT 0,
                     created_at  TIMESTAMP DEFAULT NOW(),
                     updated_at  TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS api_rate_limits (
+                    user_id        BIGINT NOT NULL,
+                    bucket         TEXT NOT NULL,
+                    window_start   TIMESTAMP NOT NULL DEFAULT NOW(),
+                    request_count  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, bucket)
                 )
             """)
 
