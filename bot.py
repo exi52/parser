@@ -162,6 +162,9 @@ ACTIVE_SUB_EMOJI = '<tg-emoji emoji-id="5089626255389623979">✅</tg-emoji>'
 TRIAL_ACCESS_EMOJI = '<tg-emoji emoji-id="5089366616026645907">🎟️</tg-emoji>'
 INACTIVE_SUB_EMOJI = '<tg-emoji emoji-id="5089370193734403650">❌</tg-emoji>'
 BLOCKED_ACCOUNT_EMOJI = '<tg-emoji emoji-id="5089249290405021457">⛔</tg-emoji>'
+REF_LINK_EMOJI = '<tg-emoji emoji-id="5062404628113524215">🔗</tg-emoji>'
+REFERRALS_EMOJI = '<tg-emoji emoji-id="5062138387385813889">👥</tg-emoji>'
+STATS_EMOJI = '<tg-emoji emoji-id="5062159634589027240">📊</tg-emoji>'
 
 def kb_main(is_admin=False):
     bulk_web_row = []
@@ -542,7 +545,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Статистика ────────────────────────────────────────────────────────────
     if data == "stats":
         stats = await get_user_stats(uid)
-        text  = "<b>📊 Статистика</b>\n\n"
+        text  = f"<b>{STATS_EMOJI} Статистика</b>\n\n"
         subscription_status = (
             f"{ACTIVE_SUB_EMOJI} Активна до {stats.get('sub_exp', '')}"
             if stats.get("sub_active")
@@ -562,7 +565,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot_info = await ctx.bot.get_me()
         ref_link = f"https://t.me/{bot_info.username}?start={ref_code}"
         await q.edit_message_text(
-            f"<b>🔗 Твоя реф-ссылка:</b>\n"
+            f"<b>{REF_LINK_EMOJI} Твоя реф-ссылка:</b>\n"
             f"<code>{ref_link}</code>\n\n"
             f"Друг получит {TRIAL_SEARCHES} пробных поисков на {TRIAL_HOURS}ч.\n"
             f"Приглашено: <b>{stats.get('ref_count', 0)}</b> чел.",
@@ -573,9 +576,9 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "my_referrals":
         refs = await get_referrals(uid)
         if not refs:
-            text = "👥 <b>Мои рефералы</b>\n\nПока никого нет.\nПоделись реф-ссылкой!"
+            text = f"<b>{REFERRALS_EMOJI} Мои рефералы</b>\n\nПока никого нет.\nПоделись реф-ссылкой!"
         else:
-            lines = [f"👥 <b>Мои рефералы ({len(refs)}):</b>\n"]
+            lines = [f"<b>{REFERRALS_EMOJI} Мои рефералы ({len(refs)}):</b>\n"]
             for r in refs[:15]:
                 name = r.get("username") or str(r.get("user_id","?"))
                 date = str(r.get("created",""))[:10]
