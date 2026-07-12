@@ -147,36 +147,94 @@ def esc(t):
 
 # ─── Клавиатуры ───────────────────────────────────────────────────────────────
 
+BUTTON_EMOJI = {
+    "myref": "5062404628113524215",
+    "referrals": "5062138387385813889",
+    "buy": "5062106574563052023",
+    "bulk_buy": "5089326088715241089",
+    "bulk_web": "5062163272426325775",
+    "stats": "5062159634589027240",
+    "support": "5062249249081657127",
+}
+
 def kb_main(is_admin=False):
     bulk_web_row = []
     if valid_webapp_url(MINIAPP_URL):
-        bulk_web_row = [InlineKeyboardButton("📊 Bulk Web App", web_app=WebAppInfo(url=MINIAPP_URL))]
+        bulk_web_row = [InlineKeyboardButton(
+            "Bulk Web App",
+            web_app=WebAppInfo(url=MINIAPP_URL),
+            icon_custom_emoji_id=BUTTON_EMOJI["bulk_web"],
+        )]
 
     if is_admin:
         rows = [
-            [InlineKeyboardButton("👥 Рефералы",        callback_data="admin_refs")],
-            [InlineKeyboardButton("🛒 Купить Bulk",     callback_data="bulk_buy")],
+            [InlineKeyboardButton(
+                "Рефералы",
+                callback_data="admin_refs",
+                icon_custom_emoji_id=BUTTON_EMOJI["referrals"],
+            )],
+            [InlineKeyboardButton(
+                "Купить Bulk",
+                callback_data="bulk_buy",
+                icon_custom_emoji_id=BUTTON_EMOJI["bulk_buy"],
+            )],
         ]
         if bulk_web_row:
             rows.append(bulk_web_row)
         rows.extend([
-            [InlineKeyboardButton("🔗 Моя реф-ссылка", callback_data="myref")],
-            [InlineKeyboardButton("💳 Купить подписку", callback_data="buy")],
-            [InlineKeyboardButton("🆘 Поддержка",       url=f"https://t.me/{SUPPORT_USER}")],
+            [InlineKeyboardButton(
+                "Моя реф-ссылка",
+                callback_data="myref",
+                icon_custom_emoji_id=BUTTON_EMOJI["myref"],
+            )],
+            [InlineKeyboardButton(
+                "Купить подписку",
+                callback_data="buy",
+                icon_custom_emoji_id=BUTTON_EMOJI["buy"],
+            )],
+            [InlineKeyboardButton(
+                "Поддержка",
+                url=f"https://t.me/{SUPPORT_USER}",
+                icon_custom_emoji_id=BUTTON_EMOJI["support"],
+            )],
         ])
         return InlineKeyboardMarkup(rows)
 
     rows = [
-        [InlineKeyboardButton("🔗 Моя реф-ссылка",  callback_data="myref")],
-        [InlineKeyboardButton("👥 Мои рефералы",     callback_data="my_referrals")],
-        [InlineKeyboardButton("💳 Купить подписку",  callback_data="buy")],
-        [InlineKeyboardButton("🛒 Купить Bulk",      callback_data="bulk_buy")],
+        [InlineKeyboardButton(
+            "Моя реф-ссылка",
+            callback_data="myref",
+            icon_custom_emoji_id=BUTTON_EMOJI["myref"],
+        )],
+        [InlineKeyboardButton(
+            "Мои рефералы",
+            callback_data="my_referrals",
+            icon_custom_emoji_id=BUTTON_EMOJI["referrals"],
+        )],
+        [InlineKeyboardButton(
+            "Купить подписку",
+            callback_data="buy",
+            icon_custom_emoji_id=BUTTON_EMOJI["buy"],
+        )],
+        [InlineKeyboardButton(
+            "Купить Bulk",
+            callback_data="bulk_buy",
+            icon_custom_emoji_id=BUTTON_EMOJI["bulk_buy"],
+        )],
     ]
     if bulk_web_row:
         rows.append(bulk_web_row)
     rows.extend([
-        [InlineKeyboardButton("📊 Статистика",       callback_data="stats")],
-        [InlineKeyboardButton("🆘 Поддержка",        url=f"https://t.me/{SUPPORT_USER}")],
+        [InlineKeyboardButton(
+            "Статистика",
+            callback_data="stats",
+            icon_custom_emoji_id=BUTTON_EMOJI["stats"],
+        )],
+        [InlineKeyboardButton(
+            "Поддержка",
+            url=f"https://t.me/{SUPPORT_USER}",
+            icon_custom_emoji_id=BUTTON_EMOJI["support"],
+        )],
     ])
     return InlineKeyboardMarkup(rows)
 
