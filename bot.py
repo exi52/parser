@@ -8,7 +8,7 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
                            CallbackQueryHandler, filters, ContextTypes)
 from telegram.constants import ParseMode
 
-from searcher import extract_username, run_search, reverse_lookup, is_eth_address, get_variants, enrich_balances, GOLDRUSH_API_KEY
+from searcher import extract_username, run_search, reverse_lookup, is_eth_address, get_variants, enrich_balances
 from database import consume_rate_limit, init_db, close_pool, get_pool
 from access  import (
     get_or_create_user, check_access, use_search, get_user_stats,
@@ -128,17 +128,17 @@ async def log_admin_action(ctx: ContextTypes.DEFAULT_TYPE, actor_id: int, action
 
 # ── Тарифы ────────────────────────────────────────────────────────────────────
 PLANS = {
-    "plan_1w":  {"name": "1 неделя",  "price": 9,   "days": 7},
-    "plan_1m":  {"name": "1 месяц",   "price": 29,  "days": 30},
-    "plan_3m":  {"name": "3 месяца",  "price": 69,  "days": 90},
-    "plan_life":{"name": "Навсегда",  "price": 149, "days": 36500},
+    "plan_1w":  {"name": "1 неделя",  "price": 5,  "days": 7},
+    "plan_1m":  {"name": "1 месяц",   "price": 15, "days": 30},
+    "plan_3m":  {"name": "3 месяца",  "price": 35, "days": 90},
+    "plan_life":{"name": "Навсегда",  "price": 79, "days": 36500},
 }
 
 # ── Bulk (отдельная платная функция, оплата за количество поисков) ─────────────
 BULK_PLANS = {
-    "bulk_1":  {"name": "1 поиск",    "price": 9,   "credits": 1},
-    "bulk_5":  {"name": "5 поисков",  "price": 39,  "credits": 5},
-    "bulk_20": {"name": "20 поисков", "price": 129, "credits": 20},
+    "bulk_1":  {"name": "1 запуск",    "price": 4,  "credits": 1},
+    "bulk_5":  {"name": "5 запусков",  "price": 15, "credits": 5},
+    "bulk_20": {"name": "20 запусков", "price": 49, "credits": 20},
 }
 
 def esc(t):
