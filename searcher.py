@@ -19,6 +19,9 @@ SEARCH_CACHE_SECONDS          = int(os.getenv("SEARCH_CACHE_SECONDS", "900"))
 PLATFORM_TIMEOUT_SECONDS      = int(os.getenv("PLATFORM_TIMEOUT_SECONDS", "16"))
 BULK_PLATFORM_TIMEOUT_SECONDS = int(os.getenv("BULK_PLATFORM_TIMEOUT_SECONDS", "5"))
 BULK_USERNAME_TIMEOUT_SECONDS = int(os.getenv("BULK_USERNAME_TIMEOUT_SECONDS", "12"))
+BULK_SOURCE_CONCURRENCY       = max(1, int(os.getenv("BULK_SOURCE_CONCURRENCY", "6")))
+BULK_ENS_RETRY_DELAY_SECONDS  = max(0.0, float(os.getenv("BULK_ENS_RETRY_DELAY_SECONDS", "0.35")))
+BULK_ENS_RETRY_TIMEOUT_SECONDS = int(os.getenv("BULK_ENS_RETRY_TIMEOUT_SECONDS", "8"))
 OPENSEA_API_KEY               = os.getenv("OPENSEA_KEY", "")
 WEB3BIO_API_KEY               = os.getenv("WEB3BIO_API_KEY", "")
 
@@ -302,29 +305,6 @@ async def check_farcaster(client, username, variants):
         except Exception:
             pass
     return {"found": False, "platform": "Farcaster", "emoji": "🔵"}
-
-
-async def check_ens(client, username, variants):
-    """ENS: username.eth → Ethereum адрес через The Graph API"""
-    eth_names = [d for d in variants["domains"] if d.endswith(".eth")]
-    for name in eth_names[:3]:
-        try:
-            r = await client.post(
-                "https://api.thegraph.com/subgraphs/name/ensdomains/ens",
-                json={"query": f'{{domains(where:{{name:"{name}"}}){{name owner{{id}} resolvedAddress{{id}}}}}}'},
-                timeout=10)
-            if r.status_code == 200:
-                doms = r.json().get("data", {}).get("domains", [])
-                if doms:
-                    d      = doms[0]
-                    wallet = (d.get("resolvedAddress") or {}).get("id") or (d.get("owner") or {}).get("id")
-                    if wallet and wallet != "0x0000000000000000000000000000000000000000":
-                        return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
-                                "url": f"https://app.ens.domains/{name}", "matched": name,
-                                "wallets": [wallet], "extra": {"домен": name}}
-        except Exception:
-            pass
-    return {"found": False, "platform": "ENS (.eth)", "emoji": "🔷"}
 
 
 async def check_sns(client, username, variants):
@@ -992,9 +972,16 @@ BULK_PLATFORMS = [
     check_web3bio,
     check_farcaster,
     check_lens,
+    check_sns,
+    check_spaceid,
     check_basename,
     check_opensea_v2,
 ]
+
+_BULK_PLATFORM_SEMAPHORES = {
+    fn.__name__: asyncio.Semaphore(BULK_SOURCE_CONCURRENCY)
+    for fn in BULK_PLATFORMS
+}
 
 def _cache_key(username: str) -> str:
     return username.strip().lower()
@@ -1047,7 +1034,16 @@ def _get_bulk_cached(username: str) -> dict | None:
 def _set_bulk_cached(username: str, data: dict):
     if SEARCH_CACHE_SECONDS <= 0:
         return
-    _BULK_SEARCH_CACHE[_cache_key(username)] = (time.time(), copy.deepcopy(data))
+    key = _cache_key(username)
+    existing = _BULK_SEARCH_CACHE.get(key)
+    if existing:
+        _, old_data = existing
+        data = _merge_search_data(old_data, data)
+        data["bulk_mode"] = True
+        data["bulk_complete"] = bool(
+            old_data.get("bulk_complete") or data.get("bulk_complete")
+        )
+    _BULK_SEARCH_CACHE[key] = (time.time(), copy.deepcopy(data))
     if len(_BULK_SEARCH_CACHE) > 512:
         oldest = sorted(_BULK_SEARCH_CACHE.items(), key=lambda item: item[1][0])[:128]
         for key, _ in oldest:
@@ -1110,6 +1106,8 @@ def _clean_result(result: dict, username: str, elapsed_ms: int, error: str | Non
             continue
         if wallet.startswith("0x") and not is_real_wallet(wallet):
             continue
+        if is_eth_address(wallet):
+            wallet = wallet.lower()
         wallets.append(wallet)
     result["wallets"] = list(dict.fromkeys(wallets))
     return result
@@ -1203,6 +1201,18 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
         )
 
 
+async def _run_bulk_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
+    semaphore = _BULK_PLATFORM_SEMAPHORES[fn.__name__]
+    async with semaphore:
+        return await _run_platform(
+            fn,
+            client,
+            username,
+            variants,
+            platform_timeout=platform_timeout or BULK_PLATFORM_TIMEOUT_SECONDS,
+        )
+
+
 async def run_search(username: str) -> dict:
     # Позитивный кэш
     cached = _get_cached(username)
@@ -1283,11 +1293,11 @@ def _build_search_response(username: str, variants: dict, results: list[dict], s
     }
 
 
-async def run_bulk_search(username: str, stop_after_first_wallet: bool = True) -> dict:
+async def run_bulk_search(username: str) -> dict:
     """
-    Быстрый режим для TXT/CSV bulk.
-    Проверяет только стабильные API, режет таймауты и по умолчанию останавливается
-    после первого найденного кошелька.
+    Полный режим для TXT/CSV bulk.
+    Надёжные источники проверяются параллельно; временный сбой ENS повторяется,
+    а неполные ответы с ошибками источников не закрепляются в bulk-кэше.
     """
     cached = _get_cached(username)
     if cached:
@@ -1302,18 +1312,33 @@ async def run_bulk_search(username: str, stop_after_first_wallet: bool = True) -
     results = []
 
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=BULK_USERNAME_TIMEOUT_SECONDS) as client:
-        for fn in BULK_PLATFORMS:
-            result = await _run_platform(
-                fn, client, username, variants,
-                platform_timeout=BULK_PLATFORM_TIMEOUT_SECONDS,
+        results = await asyncio.gather(*[
+            _run_bulk_platform(fn, client, username, variants)
+            for fn in BULK_PLATFORMS
+        ])
+
+        ens_index = BULK_PLATFORMS.index(check_ens)
+        ens_result = results[ens_index]
+        if not ens_result.get("wallets") and ens_result.get("error"):
+            if BULK_ENS_RETRY_DELAY_SECONDS:
+                await asyncio.sleep(BULK_ENS_RETRY_DELAY_SECONDS)
+            ens_retry = await _run_bulk_platform(
+                check_ens,
+                client,
+                username,
+                variants,
+                platform_timeout=BULK_ENS_RETRY_TIMEOUT_SECONDS,
             )
-            results.append(result)
-            if stop_after_first_wallet and result.get("wallets"):
-                break
+            if ens_retry.get("wallets") or not ens_retry.get("error"):
+                results[ens_index] = ens_retry
 
     data = _build_search_response(username, variants, results, started)
     data["bulk_mode"] = True
-    if data["found_count"] > 0:
+    data["bulk_complete"] = not any(result.get("error") for result in results)
+    data["diagnostics"]["ens_retried"] = bool(
+        ens_result.get("error") and not ens_result.get("wallets")
+    )
+    if data["all_wallets"] and data["bulk_complete"]:
         _set_bulk_cached(username, data)
     return data
 
