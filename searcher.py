@@ -22,8 +22,12 @@ BULK_USERNAME_TIMEOUT_SECONDS = int(os.getenv("BULK_USERNAME_TIMEOUT_SECONDS", "
 BULK_SOURCE_CONCURRENCY       = max(1, int(os.getenv("BULK_SOURCE_CONCURRENCY", "6")))
 BULK_ENS_RETRY_DELAY_SECONDS  = max(0.0, float(os.getenv("BULK_ENS_RETRY_DELAY_SECONDS", "0.35")))
 BULK_ENS_RETRY_TIMEOUT_SECONDS = int(os.getenv("BULK_ENS_RETRY_TIMEOUT_SECONDS", "8"))
+BULK_WEB3BIO_TIMEOUT_SECONDS  = int(os.getenv("BULK_WEB3BIO_TIMEOUT_SECONDS", "30"))
 OPENSEA_API_KEY               = os.getenv("OPENSEA_KEY", "")
 WEB3BIO_API_KEY               = os.getenv("WEB3BIO_API_KEY", "")
+WEB3BIO_CONCURRENCY           = max(1, int(os.getenv("WEB3BIO_CONCURRENCY", "1")))
+WEB3BIO_MIN_INTERVAL_SECONDS  = max(0.0, float(os.getenv("WEB3BIO_MIN_INTERVAL_SECONDS", "0.25")))
+WEB3BIO_429_RETRIES           = max(0, int(os.getenv("WEB3BIO_429_RETRIES", "2")))
 
 # ── GoldRush (Covalent) — суммарный баланс кошелька в USD ──────────────────────
 GOLDRUSH_API_KEY    = os.getenv("GOLDRUSH_API_KEY", "")
@@ -65,6 +69,9 @@ _FREE_PRICE_CACHE: tuple[float, dict[str, float]] | None = None
 _FREE_PRICE_INFLIGHT: asyncio.Task | None = None
 _FREE_TOKEN_PRICE_CACHE: dict[str, tuple[float, float | None, str]] = {}
 _FREE_PRICE_SEMAPHORE = asyncio.Semaphore(2)
+_WEB3BIO_SEMAPHORE = asyncio.Semaphore(WEB3BIO_CONCURRENCY)
+_WEB3BIO_RATE_LOCK = asyncio.Lock()
+_WEB3BIO_NEXT_REQUEST = 0.0
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
 _BULK_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
@@ -180,6 +187,15 @@ HEADERS = {
 }
 
 
+async def _wait_web3bio_rate_slot():
+    global _WEB3BIO_NEXT_REQUEST
+    async with _WEB3BIO_RATE_LOCK:
+        now = time.monotonic()
+        if now < _WEB3BIO_NEXT_REQUEST:
+            await asyncio.sleep(_WEB3BIO_NEXT_REQUEST - now)
+        _WEB3BIO_NEXT_REQUEST = time.monotonic() + WEB3BIO_MIN_INTERVAL_SECONDS
+
+
 class _TrackedClient:
     """Tracks whether a source was reachable even when a checker handles exceptions itself."""
 
@@ -187,15 +203,40 @@ class _TrackedClient:
         self.client = client
         self.attempts = 0
         self.available_responses = 0
+        self.status_counts: dict[int, int] = {}
+        self.exception_count = 0
 
-    async def _request(self, method: str, *args, **kwargs):
+    async def _request_once(self, method: str, *args, **kwargs):
         self.attempts += 1
         try:
             response = await getattr(self.client, method)(*args, **kwargs)
         except Exception:
+            self.exception_count += 1
             raise
-        if response.status_code < 400 or response.status_code == 404:
+        status = response.status_code
+        self.status_counts[status] = self.status_counts.get(status, 0) + 1
+        if status < 400 or status == 404:
             self.available_responses += 1
+        return response
+
+    async def _request(self, method: str, *args, **kwargs):
+        url = str(args[0]) if args else str(kwargs.get("url", ""))
+        if "api.web3.bio" not in url.lower():
+            return await self._request_once(method, *args, **kwargs)
+
+        for attempt in range(WEB3BIO_429_RETRIES + 1):
+            async with _WEB3BIO_SEMAPHORE:
+                await _wait_web3bio_rate_slot()
+                response = await self._request_once(method, *args, **kwargs)
+            if response.status_code != 429 or attempt >= WEB3BIO_429_RETRIES:
+                return response
+            retry_after = response.headers.get("Retry-After", "")
+            try:
+                delay = max(float(retry_after), 0.25)
+            except (TypeError, ValueError):
+                delay = min(2.0, 0.5 * (2 ** attempt))
+            await asyncio.sleep(delay)
+
         return response
 
     async def get(self, *args, **kwargs):
@@ -796,7 +837,7 @@ async def check_basename(client, username, variants):
     for name in list(dict.fromkeys(candidates))[:3]:
         try:
             r = await client.get(
-                f"https://api.web3.bio/profile/basenames/{name}",
+                f"https://api.web3.bio/ns/basenames/{name}",
                 headers=web3bio_headers(),
                 timeout=10)
             if r.status_code == 200:
@@ -901,14 +942,19 @@ async def check_ens(client, username, variants):
                 timeout=10,
             )
             if r.status_code == 200:
-                doms = r.json().get("data", {}).get("domains", [])
-                if doms:
+                payload = r.json()
+                graph_data = payload.get("data")
+                doms = graph_data.get("domains") if isinstance(graph_data, dict) else None
+                if isinstance(doms, list) and doms:
                     domain = doms[0]
                     wallet = (domain.get("resolvedAddress") or {}).get("id") or (domain.get("owner") or {}).get("id")
                     if wallet and is_real_wallet(wallet):
                         return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
                                 "url": f"https://app.ens.domains/{name}", "matched": name,
                                 "wallets": [wallet], "extra": {"domain": name, "source": "thegraph"}}
+                if isinstance(doms, list) and not payload.get("errors"):
+                    return {"found": False, "platform": "ENS (.eth)", "emoji": "🔷"}
+                log.debug("ens graph malformed response name=%s payload=%s", name, str(payload)[:200])
             elif r.status_code in (429, 500, 502, 503, 504):
                 log.debug("ens graph temporary failure name=%s status=%s", name, r.status_code)
         except Exception:
@@ -927,7 +973,7 @@ async def check_ens(client, username, variants):
 
         try:
             r = await client.get(
-                f"https://api.web3.bio/profile/{name}",
+                f"https://api.web3.bio/ns/ens/{name}",
                 headers=web3bio_headers(),
                 timeout=10,
             )
@@ -973,7 +1019,6 @@ BULK_PLATFORMS = [
     check_farcaster,
     check_lens,
     check_sns,
-    check_spaceid,
     check_basename,
     check_opensea_v2,
 ]
@@ -1153,6 +1198,19 @@ def _get_platform_hit(fn_name: str, username: str, variants: dict) -> dict | Non
     return None
 
 
+def _attach_source_diagnostics(result: dict, tracked: _TrackedClient) -> dict:
+    if tracked.attempts or tracked.exception_count:
+        result["source_diagnostics"] = {
+            "attempts": tracked.attempts,
+            "statuses": {
+                str(status): count
+                for status, count in sorted(tracked.status_counts.items())
+            },
+            "exceptions": tracked.exception_count,
+        }
+    return result
+
+
 async def _run_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
     started = time.perf_counter()
     timeout = platform_timeout or PLATFORM_TIMEOUT_SECONDS
@@ -1170,7 +1228,7 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
             cached_hit = _get_platform_hit(fn.__name__, username, variants)
             if cached_hit:
                 cached_hit["elapsed_ms"] = elapsed_ms
-                return cached_hit
+                return _attach_source_diagnostics(cached_hit, tracked)
         if cleaned.get("found"):
             _remember_platform_hit(fn.__name__, username, variants, cleaned)
             log.info(
@@ -1180,36 +1238,45 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
                 len(cleaned.get("wallets") or []),
                 elapsed_ms,
             )
-        return cleaned
+        return _attach_source_diagnostics(cleaned, tracked)
     except asyncio.TimeoutError:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         log.warning("search timeout platform=%s username=%s", fn.__name__, username)
-        return _clean_result(
+        result = _clean_result(
             {"found": False, "platform": fn.__name__.replace("check_", ""), "emoji": "⏱"},
             username,
             elapsed_ms,
             "timeout",
         )
+        return _attach_source_diagnostics(result, tracked)
     except Exception as exc:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         log.exception("search error platform=%s username=%s", fn.__name__, username)
-        return _clean_result(
+        result = _clean_result(
             {"found": False, "platform": fn.__name__.replace("check_", ""), "emoji": "⚠"},
             username,
             elapsed_ms,
             str(exc)[:120],
         )
+        return _attach_source_diagnostics(result, tracked)
 
 
 async def _run_bulk_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
     semaphore = _BULK_PLATFORM_SEMAPHORES[fn.__name__]
+    timeout = platform_timeout
+    if timeout is None:
+        timeout = (
+            BULK_WEB3BIO_TIMEOUT_SECONDS
+            if fn in (check_web3bio, check_basename)
+            else BULK_PLATFORM_TIMEOUT_SECONDS
+        )
     async with semaphore:
         return await _run_platform(
             fn,
             client,
             username,
             variants,
-            platform_timeout=platform_timeout or BULK_PLATFORM_TIMEOUT_SECONDS,
+            platform_timeout=timeout,
         )
 
 
@@ -1243,6 +1310,14 @@ async def run_search(username: str) -> dict:
         "errors": [
             {"platform": r.get("platform"), "error": r.get("error")}
             for r in ordered_results if r.get("error")
+        ],
+        "rate_limits": [
+            {
+                "platform": r.get("platform"),
+                "count": (r.get("source_diagnostics") or {}).get("statuses", {}).get("429", 0),
+            }
+            for r in ordered_results
+            if (r.get("source_diagnostics") or {}).get("statuses", {}).get("429", 0)
         ],
     }
 
@@ -1288,6 +1363,14 @@ def _build_search_response(username: str, variants: dict, results: list[dict], s
                 {"platform": r.get("platform"), "error": r.get("error")}
                 for r in ordered_results if r.get("error")
             ],
+            "rate_limits": [
+                {
+                    "platform": r.get("platform"),
+                    "count": (r.get("source_diagnostics") or {}).get("statuses", {}).get("429", 0),
+                }
+                for r in ordered_results
+                if (r.get("source_diagnostics") or {}).get("statuses", {}).get("429", 0)
+            ],
         },
         "cache_hit":       cache_hit,
     }
@@ -1308,6 +1391,14 @@ async def run_bulk_search(username: str) -> dict:
         return cached
 
     variants = get_variants(username)
+    dotted_domain = username.strip().lower().replace("_", ".")
+    if any(dotted_domain.endswith(suffix) for suffix in DOMAIN_SUFFIXES):
+        variants["base"] = list(dict.fromkeys(
+            [dotted_domain] + variants["base"]
+        ))
+        variants["domains"] = list(dict.fromkeys(
+            [dotted_domain] + variants["domains"]
+        ))
     started = time.perf_counter()
     results = []
 
