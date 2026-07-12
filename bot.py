@@ -157,6 +157,12 @@ BUTTON_EMOJI = {
     "support": "5062249249081657127",
 }
 
+TITLE_EMOJI = '<tg-emoji emoji-id="5089259641276205618">🔍</tg-emoji>'
+ACTIVE_SUB_EMOJI = '<tg-emoji emoji-id="5089626255389623979">✅</tg-emoji>'
+TRIAL_ACCESS_EMOJI = '<tg-emoji emoji-id="5089366616026645907">🎟️</tg-emoji>'
+INACTIVE_SUB_EMOJI = '<tg-emoji emoji-id="5089370193734403650">❌</tg-emoji>'
+BLOCKED_ACCOUNT_EMOJI = '<tg-emoji emoji-id="5089249290405021457">⛔</tg-emoji>'
+
 def kb_main(is_admin=False):
     bulk_web_row = []
     if valid_webapp_url(MINIAPP_URL):
@@ -470,19 +476,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if has_access:
         if stats.get("sub_active"):
-            status = f"✅ Подписка активна до {stats.get('sub_exp')}"
+            status = f"{ACTIVE_SUB_EMOJI} Подписка активна до {stats.get('sub_exp')}"
         else:
-            status = f"⏳ Пробный доступ: {stats.get('trial_left',0)} поисков до {stats.get('trial_exp','')}"
+            status = f"{TRIAL_ACCESS_EMOJI} Пробный доступ: {stats.get('trial_left',0)} поисков до {stats.get('trial_exp','')}"
     else:
         status = {
-            "no_sub":       "❌ Нет подписки",
-            "trial_expired":"⌛ Пробный период истёк",
-            "sub_expired":  "⌛ Подписка истекла",
-            "blocked":      "⛔ Аккаунт заблокирован",
-        }.get(reason, "❌ Нет доступа")
+            "no_sub":       f"{INACTIVE_SUB_EMOJI} Нет подписки",
+            "trial_expired":f"{INACTIVE_SUB_EMOJI} Пробный период истёк",
+            "sub_expired":  f"{INACTIVE_SUB_EMOJI} Подписка истекла",
+            "blocked":      f"{BLOCKED_ACCOUNT_EMOJI} Аккаунт заблокирован",
+        }.get(reason, f"{INACTIVE_SUB_EMOJI} Нет доступа")
 
     await update.message.reply_text(
-        f"<b>🔍 Crypto OSINT Bot · BULK-v2</b>\n\n"
+        f"<b>{TITLE_EMOJI} Crypto OSINT Bot · BULK-v2</b>\n\n"
         f"Статус: {status}\n\n"
         f"Отправь @username или 0x адрес для поиска.",
         parse_mode=ParseMode.HTML,
@@ -518,15 +524,16 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         has_access, reason = await check_access(uid)
         stats = await get_user_stats(uid)
         if has_access:
-            status = f"✅ Подписка до {stats.get('sub_exp')}" if stats.get("sub_active") else f"⏳ Пробный: {stats.get('trial_left',0)} поисков"
+            status = f"{ACTIVE_SUB_EMOJI} Подписка до {stats.get('sub_exp')}" if stats.get("sub_active") else f"{TRIAL_ACCESS_EMOJI} Пробный: {stats.get('trial_left',0)} поисков"
         else:
             status = {
-                "blocked": "⛔ Аккаунт заблокирован",
-                "sub_expired": "⌛ Подписка истекла",
-                "trial_expired": "⌛ Пробный период истёк",
-            }.get(reason, "❌ Нет подписки")
+                "blocked": f"{BLOCKED_ACCOUNT_EMOJI} Аккаунт заблокирован",
+                "sub_expired": f"{INACTIVE_SUB_EMOJI} Подписка истекла",
+                "trial_expired": f"{INACTIVE_SUB_EMOJI} Пробный период истёк",
+            }.get(reason, f"{INACTIVE_SUB_EMOJI} Нет подписки")
+        heading = "👑 Панель администратора" if admin else f"{TITLE_EMOJI} Crypto OSINT Bot"
         await q.edit_message_text(
-            f"<b>{'👑 Панель администратора' if admin else '🔍 Crypto OSINT Bot'} · BULK-v2</b>"
+            f"<b>{heading} · BULK-v2</b>"
             + (f"\n\nСтатус: {status}" if not admin else ""),
             parse_mode=ParseMode.HTML,
             reply_markup=kb_main(is_admin=admin))
@@ -536,7 +543,12 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "stats":
         stats = await get_user_stats(uid)
         text  = "<b>📊 Статистика</b>\n\n"
-        text += f"Подписка: {'✅ Активна до ' + stats.get('sub_exp','') if stats.get('sub_active') else '❌ Нет'}\n"
+        subscription_status = (
+            f"{ACTIVE_SUB_EMOJI} Активна до {stats.get('sub_exp', '')}"
+            if stats.get("sub_active")
+            else f"{INACTIVE_SUB_EMOJI} Нет"
+        )
+        text += f"Подписка: {subscription_status}\n"
         if stats.get("trial_left"):
             text += f"Пробных поисков: {stats['trial_left']} (до {stats.get('trial_exp','')})\n"
         text += f"Рефералов: {stats.get('ref_count', 0)}"
@@ -662,7 +674,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── Отмена отправки хеша ─────────────────────────────────────────────────
     if data == "cancel_hash":
         await q.edit_message_text(
-            "<b>🔍 Crypto OSINT Bot · BULK-v2</b>",
+            f"<b>{TITLE_EMOJI} Crypto OSINT Bot · BULK-v2</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_main())
         return
@@ -756,7 +768,7 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "bulk_cancel_hash":
         await q.edit_message_text(
-            "<b>🔍 Crypto OSINT Bot · BULK-v2</b>",
+            f"<b>{TITLE_EMOJI} Crypto OSINT Bot · BULK-v2</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=kb_main(is_admin=is_admin(uid)))
         return
