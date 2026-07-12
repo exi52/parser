@@ -1,5 +1,5 @@
 python-telegram-bot==22.8
-httpx==0.25.2
+httpx==0.28.1
 python-dotenv==1.0.0
 asyncpg==0.29.0
 fastapi==0.115.6
