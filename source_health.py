@@ -45,6 +45,8 @@ class SourceCircuitOpen(RuntimeError):
 
 _circuits: dict[str, dict[str, Any]] = {}
 _circuit_lock = asyncio.Lock()
+_circuit_refresh_lock = asyncio.Lock()
+_circuits_refreshed_at = 0.0
 _metrics: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
 _flush_task: asyncio.Task | None = None
 
@@ -61,7 +63,6 @@ def _state(source: str) -> dict[str, Any]:
         "opened_until": 0.0,
         "open_count": 0,
         "probe_in_flight": False,
-        "last_db_refresh": 0.0,
         "last_status": None,
         "last_error": None,
         "recent_failures": [],
@@ -91,40 +92,57 @@ async def _delayed_flush():
     await flush_source_metrics()
 
 
-async def _refresh_from_db(source: str, state: dict[str, Any]):
+async def _refresh_circuits_from_db():
+    """Refresh every circuit with one query instead of one query per source."""
+    global _circuits_refreshed_at
     if not DATABASE_URL:
         return
     now = time.time()
-    if now - state["last_db_refresh"] < CIRCUIT_DB_REFRESH_SECONDS:
+    if now - _circuits_refreshed_at < CIRCUIT_DB_REFRESH_SECONDS:
         return
-    state["last_db_refresh"] = now
-    try:
-        pool = await _get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT state, consecutive_failures, opened_until, open_count, last_status, last_error "
-                "FROM source_circuits WHERE source=$1",
-                source,
-            )
-        if not row:
+
+    async with _circuit_refresh_lock:
+        now = time.time()
+        if now - _circuits_refreshed_at < CIRCUIT_DB_REFRESH_SECONDS:
             return
-        opened_until = row["opened_until"]
-        opened_epoch = opened_until.replace(tzinfo=timezone.utc).timestamp() if opened_until else 0.0
-        if opened_epoch > state["opened_until"] or row["state"] == "open":
-            state["state"] = row["state"]
-            state["consecutive_failures"] = row["consecutive_failures"] or 0
-            state["opened_until"] = opened_epoch
-            state["open_count"] = row["open_count"] or 0
-            state["last_status"] = row["last_status"]
-            state["last_error"] = row["last_error"]
-    except Exception:
-        return
+        # Back off briefly even when PostgreSQL is unavailable. Otherwise every
+        # outgoing API request would immediately retry the same failed refresh.
+        _circuits_refreshed_at = now
+        try:
+            pool = await _get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT source, state, consecutive_failures, opened_until, "
+                    "open_count, last_status, last_error FROM source_circuits"
+                )
+        except Exception:
+            return
+
+        async with _circuit_lock:
+            for row in rows:
+                row_state = row["state"] or "closed"
+                if row_state not in ("open", "half_open"):
+                    continue
+                state = _state(row["source"])
+                opened_until = row["opened_until"]
+                opened_epoch = (
+                    opened_until.replace(tzinfo=timezone.utc).timestamp()
+                    if opened_until else 0.0
+                )
+                if opened_epoch < state["opened_until"] and state["state"] == "open":
+                    continue
+                state["state"] = row_state
+                state["consecutive_failures"] = row["consecutive_failures"] or 0
+                state["opened_until"] = opened_epoch
+                state["open_count"] = row["open_count"] or 0
+                state["last_status"] = row["last_status"]
+                state["last_error"] = row["last_error"]
 
 
 async def before_source_request(source: str):
+    await _refresh_circuits_from_db()
     async with _circuit_lock:
         state = _state(source)
-        await _refresh_from_db(source, state)
         now = time.time()
         if state["state"] == "open":
             if now < state["opened_until"]:

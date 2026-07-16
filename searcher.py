@@ -32,7 +32,7 @@ from source_health import (
 log = logging.getLogger(__name__)
 
 SEARCH_CACHE_SECONDS          = int(os.getenv("SEARCH_CACHE_SECONDS", "900"))
-PLATFORM_TIMEOUT_SECONDS      = int(os.getenv("PLATFORM_TIMEOUT_SECONDS", "16"))
+PLATFORM_TIMEOUT_SECONDS      = int(os.getenv("PLATFORM_TIMEOUT_SECONDS", "10"))
 BULK_PLATFORM_TIMEOUT_SECONDS = int(os.getenv("BULK_PLATFORM_TIMEOUT_SECONDS", "5"))
 BULK_USERNAME_TIMEOUT_SECONDS = int(os.getenv("BULK_USERNAME_TIMEOUT_SECONDS", "12"))
 BULK_SOURCE_CONCURRENCY       = max(1, int(os.getenv("BULK_SOURCE_CONCURRENCY", "6")))
@@ -48,8 +48,10 @@ WEB3BIO_BATCH_SIZE            = min(30, max(1, int(os.getenv("WEB3BIO_BATCH_SIZE
 WEB3BIO_BATCH_WORKERS         = max(1, int(os.getenv("WEB3BIO_BATCH_WORKERS", "2")))
 WEB3BIO_BATCH_CACHE_SECONDS   = max(60, int(os.getenv("WEB3BIO_BATCH_CACHE_SECONDS", "3600")))
 WEB3BIO_BATCH_ERROR_SECONDS   = max(1, int(os.getenv("WEB3BIO_BATCH_ERROR_SECONDS", "15")))
-ENS_UNIVERSAL_TIMEOUT_SECONDS = max(3, int(os.getenv("ENS_UNIVERSAL_TIMEOUT_SECONDS", "12")))
+ENS_UNIVERSAL_TIMEOUT_SECONDS = max(3, int(os.getenv("ENS_UNIVERSAL_TIMEOUT_SECONDS", "5")))
 ENS_UNIVERSAL_CONCURRENCY     = max(1, int(os.getenv("ENS_UNIVERSAL_CONCURRENCY", "16")))
+ALCHEMY_ETH_RPC_URL           = os.getenv("ALCHEMY_ETH_RPC_URL", "").strip()
+UNSTOPPABLE_API_KEY           = os.getenv("UNSTOPPABLE_API_KEY", "").strip()
 CLUSTERS_API_KEY              = os.getenv("CLUSTERS_API_KEY", "")
 CLUSTERS_BATCH_SIZE           = max(1, int(os.getenv("CLUSTERS_BATCH_SIZE", "100")))
 CLUSTERS_BATCH_WORKERS        = max(1, int(os.getenv("CLUSTERS_BATCH_WORKERS", "2")))
@@ -77,12 +79,12 @@ BALANCE_CACHE_SECONDS = int(os.getenv("BALANCE_CACHE_SECONDS", str(GOLDRUSH_CACH
 GOLDRUSH_RETRIES = max(1, int(os.getenv("GOLDRUSH_RETRIES", "3")))
 BALANCE_MAX_TOKEN_USD = float(os.getenv("BALANCE_MAX_TOKEN_USD", "100000000000"))
 BALANCE_PROVIDER = os.getenv("BALANCE_PROVIDER", "free").strip().lower()
-FREE_RPC_TIMEOUT = int(os.getenv("FREE_RPC_TIMEOUT", "10"))
+FREE_RPC_TIMEOUT = int(os.getenv("FREE_RPC_TIMEOUT", "5"))
 FREE_RPC_CONCURRENCY = max(1, int(os.getenv("FREE_RPC_CONCURRENCY", "8")))
 FREE_PRICE_CACHE_SECONDS = int(os.getenv("FREE_PRICE_CACHE_SECONDS", "300"))
 
 SOLANA_RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet.solana.com")
-SOLANA_TIMEOUT = int(os.getenv("SOLANA_TIMEOUT", "12"))
+SOLANA_TIMEOUT = int(os.getenv("SOLANA_TIMEOUT", "7"))
 SOLANA_USDC_MINT = os.getenv("SOLANA_USDC_MINT", "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 SOLANA_TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 SOLANA_TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -108,7 +110,6 @@ _WEB3BIO_NEXT_REQUEST = 0.0
 _WEB3BIO_BATCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _WEB3BIO_BATCH_PENDING: dict[str, asyncio.Future] = {}
 _ENS_UNIVERSAL_SEMAPHORE = asyncio.Semaphore(ENS_UNIVERSAL_CONCURRENCY)
-_ENS_RPC_NEXT = 0
 _CLUSTERS_BATCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _CLUSTERS_BATCH_PENDING: dict[str, asyncio.Future] = {}
 
@@ -792,6 +793,8 @@ async def check_farcaster(client, username, variants):
             r = await client.get(
                 f"https://api.warpcast.com/v2/user-by-username?username={v}",
                 timeout=10)
+            if r.status_code == 429:
+                break
             if r.status_code == 200:
                 user = r.json().get("result", {}).get("user", {})
                 if not user:
@@ -825,6 +828,8 @@ async def check_sns(client, username, variants):
             r = await client.get(
                 f"https://sns-sdk-proxy.bonfida.workers.dev/resolve/{domain}",
                 timeout=10)
+            if r.status_code == 429:
+                break
             if r.status_code == 200:
                 payload = r.json()
                 addr = payload.get("result")
@@ -843,11 +848,17 @@ async def check_unstoppable(client, username, variants):
     """Unstoppable Domains API — возвращает точный owner адрес"""
     ud_ext   = [".crypto", ".nft", ".wallet", ".x", ".blockchain", ".dao", ".888"]
     ud_names = [d for d in variants["domains"] if any(d.endswith(e) for e in ud_ext)]
+    headers = dict(HEADERS)
+    if UNSTOPPABLE_API_KEY:
+        headers["Authorization"] = f"Bearer {UNSTOPPABLE_API_KEY}"
     for name in ud_names[:6]:
         try:
             r = await client.get(
                 f"https://api.unstoppabledomains.com/resolve/domains/{name}",
+                headers=headers,
                 timeout=8)
+            if r.status_code in (401, 403, 429):
+                break
             if r.status_code == 200:
                 owner = (r.json().get("meta") or {}).get("owner")
                 if owner and owner != "0x0000000000000000000000000000000000000000":
@@ -876,6 +887,8 @@ async def check_lens(client, username, variants):
                 },
                 headers={**HEADERS, "Content-Type": "application/json"},
                 timeout=12)
+            if r.status_code == 429:
+                break
             if r.status_code == 200:
                 profile = r.json().get("data", {}).get("profile")
                 if profile:
@@ -896,6 +909,8 @@ async def check_spaceid(client, username, variants):
     for name in target[:4]:
         try:
             r = await client.get(f"https://api.web3.bio/profile/{name}", headers=web3bio_headers(), timeout=10)
+            if r.status_code == 429:
+                break
             if r.status_code != 200:
                 continue
             data     = r.json()
@@ -962,6 +977,8 @@ async def check_web3bio(client, username, variants):
     for v in variants["base"][:3]:
         try:
             r = await client.get(f"https://api.web3.bio/profile/{v}", headers=web3bio_headers(), timeout=10)
+            if r.status_code == 429:
+                break
             if r.status_code != 200:
                 continue
             data     = r.json()
@@ -999,6 +1016,8 @@ async def check_github(client, username, variants):
                 f"https://api.github.com/users/{v}",
                 headers={**HEADERS, "Accept": "application/vnd.github+json"},
                 timeout=10)
+            if r.status_code in (403, 429):
+                break
             if r.status_code == 200:
                 data = r.json()
                 # Ищем только в bio и blog — не в HTML странице
@@ -1025,6 +1044,8 @@ async def check_gitcoin(client, username, variants):
         try:
             r = await client.get(
                 f"https://gitcoin.co/api/v0.1/profile/{v.lower()}", timeout=10)
+            if r.status_code == 429:
+                break
             if r.status_code == 200:
                 data = r.json()
                 if data.get("handle"):
@@ -1048,6 +1069,8 @@ async def check_snapshot(client, username, variants):
                       "variables": {"s": v.lower()}},
                 headers={**HEADERS, "Content-Type": "application/json"},
                 timeout=10)
+            if r.status_code in (400, 401, 403, 429):
+                break
             if r.status_code == 200:
                 spaces = r.json().get("data", {}).get("spaces", [])
                 if spaces:
@@ -1237,6 +1260,8 @@ async def check_blur_api(client, username, variants):
                 f"https://core-api.prod.blur.io/v1/users/{v.lower()}",
                 headers={**HEADERS, "Origin": "https://blur.io", "Referer": "https://blur.io/"},
                 timeout=10)
+            if r.status_code in (401, 403, 429):
+                break
             if r.status_code == 200:
                 addr = (r.json().get("user") or {}).get("walletAddress")
                 if addr and is_real_wallet(addr):
@@ -1302,6 +1327,8 @@ async def check_opensea_v2(client, username, variants):
                 f"https://api.opensea.io/api/v2/accounts/{v}",
                 headers={**HEADERS, "X-API-KEY": OPENSEA_API_KEY},
                 timeout=10)
+            if r.status_code in (401, 403, 429):
+                break
             if r.status_code == 200:
                 data = r.json()
                 addr = data.get("address")
@@ -1477,18 +1504,20 @@ async def check_sui_names(client, username, variants):
 # ─── Список всех платформ (после всех функций) ───────────────────────────────
 
 def _ens_rpc_urls() -> list[str]:
-    defaults = ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"]
+    defaults = [
+        url for url in (
+            ALCHEMY_ETH_RPC_URL,
+            "https://ethereum-rpc.publicnode.com",
+            "https://eth.llamarpc.com",
+        ) if url
+    ]
     return _rpc_urls("ENS_RPC_URLS", _rpc_urls("ETH_RPC_URLS", defaults))
 
 
 def _rotated_ens_rpc_urls() -> list[str]:
-    global _ENS_RPC_NEXT
-    urls = _ens_rpc_urls()
-    if len(urls) < 2:
-        return urls
-    index = _ENS_RPC_NEXT % len(urls)
-    _ENS_RPC_NEXT += 1
-    return urls[index:] + urls[:index]
+    # Keep the most reliable configured provider first. Circuit breaker will
+    # skip it and use the next URL only when it is actually unavailable.
+    return _ens_rpc_urls()
 
 
 async def _resolve_ens_universal(name: str) -> tuple[str | None, str | None, bool]:
@@ -1561,10 +1590,8 @@ async def check_ens(client, username, variants):
     source_available = False
     temporary_errors = []
 
-    for index, name in enumerate(eth_names):
-        universal_first = index == 0 and (
-            name.count(".") >= 2 or name == variants.get("explicit_domain")
-        )
+    for name in eth_names:
+        universal_first = True
         universal_checked = False
         if universal_first:
             wallet, error, available = await _resolve_ens_universal(name)
@@ -1580,6 +1607,10 @@ async def check_ens(client, username, variants):
                 }
             if error:
                 temporary_errors.append(error)
+            elif available:
+                # A successful Universal Resolver response with no address is
+                # authoritative. Do not query the legacy indexer afterwards.
+                continue
 
         graph_available = False
         try:
@@ -2526,8 +2557,11 @@ async def _rpc_results(
 ) -> dict[int, str]:
     try:
         payload = await _rpc_post(client, url, requests)
-    except Exception:
-        payload = None
+    except Exception as exc:
+        # A dead RPC should immediately fall through to the next provider.
+        # Retrying every item against the same dead host doubled the timeout.
+        log.debug("RPC batch failed url=%s error=%s", url, type(exc).__name__)
+        return {}
 
     if isinstance(payload, list):
         results = {
