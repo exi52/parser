@@ -110,6 +110,7 @@ async def init_db():
                     total_count      INTEGER NOT NULL DEFAULT 0,
                     processed_count  INTEGER NOT NULL DEFAULT 0,
                     found_count      INTEGER NOT NULL DEFAULT 0,
+                    partial_count    INTEGER NOT NULL DEFAULT 0,
                     error            TEXT,
                     created_at       TIMESTAMP DEFAULT NOW(),
                     started_at       TIMESTAMP,
@@ -127,6 +128,8 @@ async def init_db():
                     matched     JSONB DEFAULT '[]'::jsonb,
                     balances    JSONB DEFAULT '{}'::jsonb,
                     result      JSONB DEFAULT '{}'::jsonb,
+                    partial_sources JSONB DEFAULT '[]'::jsonb,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
                     error       TEXT,
                     elapsed_ms  INTEGER DEFAULT 0,
                     created_at  TIMESTAMP DEFAULT NOW(),
@@ -142,12 +145,52 @@ async def init_db():
                     PRIMARY KEY (user_id, bucket)
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_circuits (
+                    source                  TEXT PRIMARY KEY,
+                    state                   TEXT NOT NULL DEFAULT 'closed',
+                    consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+                    opened_until            TIMESTAMP,
+                    open_count              INTEGER NOT NULL DEFAULT 0,
+                    last_status             INTEGER,
+                    last_error              TEXT,
+                    updated_at              TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_metrics_hourly (
+                    bucket              TIMESTAMP NOT NULL,
+                    source              TEXT NOT NULL,
+                    checks              BIGINT NOT NULL DEFAULT 0,
+                    requests            BIGINT NOT NULL DEFAULT 0,
+                    hits                BIGINT NOT NULL DEFAULT 0,
+                    not_found           BIGINT NOT NULL DEFAULT 0,
+                    http_404            BIGINT NOT NULL DEFAULT 0,
+                    http_429            BIGINT NOT NULL DEFAULT 0,
+                    http_5xx            BIGINT NOT NULL DEFAULT 0,
+                    timeouts            BIGINT NOT NULL DEFAULT 0,
+                    network_errors      BIGINT NOT NULL DEFAULT 0,
+                    circuit_skips       BIGINT NOT NULL DEFAULT 0,
+                    retries             BIGINT NOT NULL DEFAULT 0,
+                    recovered           BIGINT NOT NULL DEFAULT 0,
+                    latency_ms_sum       BIGINT NOT NULL DEFAULT 0,
+                    latency_ms_max       BIGINT NOT NULL DEFAULT 0,
+                    PRIMARY KEY (bucket, source)
+                )
+            """)
 
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires TIMESTAMP")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_id TEXT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bulk_expires TIMESTAMP")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bulk_credits INTEGER DEFAULT 0")
+
+            await conn.execute("ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS partial_count INTEGER DEFAULT 0")
+            await conn.execute("ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS paused_at TIMESTAMP")
+            await conn.execute("ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS canceled_at TIMESTAMP")
+            await conn.execute("ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT NOW()")
+            await conn.execute("ALTER TABLE bulk_items ADD COLUMN IF NOT EXISTS partial_sources JSONB DEFAULT '[]'::jsonb")
+            await conn.execute("ALTER TABLE bulk_items ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0")
 
             await conn.execute("ALTER TABLE keys ADD COLUMN IF NOT EXISTS plan_id TEXT")
             await conn.execute("ALTER TABLE keys ADD COLUMN IF NOT EXISTS expires TIMESTAMP")
@@ -199,5 +242,9 @@ async def init_db():
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_bulk_items_job_username
                 ON bulk_items (job_id, username)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_source_metrics_bucket
+                ON source_metrics_hourly (bucket DESC)
             """)
     print("DB ready")

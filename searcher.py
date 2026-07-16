@@ -5,13 +5,29 @@ Crypto OSINT — searcher.py
 
 import asyncio
 import copy
+import json
 import logging
 import math
 import os
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import quote, urlparse
 import httpx
+
+try:
+    from web3 import AsyncHTTPProvider, AsyncWeb3
+except ImportError:  # Optional locally; Railway installs it from requirements.txt.
+    AsyncHTTPProvider = None
+    AsyncWeb3 = None
+
+from source_health import (
+    SourceCircuitOpen,
+    before_source_request,
+    record_platform_result,
+    record_source_retry,
+    report_source_result,
+)
 
 log = logging.getLogger(__name__)
 
@@ -25,9 +41,26 @@ BULK_ENS_RETRY_TIMEOUT_SECONDS = int(os.getenv("BULK_ENS_RETRY_TIMEOUT_SECONDS",
 BULK_WEB3BIO_TIMEOUT_SECONDS  = int(os.getenv("BULK_WEB3BIO_TIMEOUT_SECONDS", "30"))
 OPENSEA_API_KEY               = os.getenv("OPENSEA_KEY", "")
 WEB3BIO_API_KEY               = os.getenv("WEB3BIO_API_KEY", "")
-WEB3BIO_CONCURRENCY           = max(1, int(os.getenv("WEB3BIO_CONCURRENCY", "1")))
+WEB3BIO_CONCURRENCY           = max(1, int(os.getenv("WEB3BIO_CONCURRENCY", "2")))
 WEB3BIO_MIN_INTERVAL_SECONDS  = max(0.0, float(os.getenv("WEB3BIO_MIN_INTERVAL_SECONDS", "0.25")))
 WEB3BIO_429_RETRIES           = max(0, int(os.getenv("WEB3BIO_429_RETRIES", "2")))
+WEB3BIO_BATCH_SIZE            = min(30, max(1, int(os.getenv("WEB3BIO_BATCH_SIZE", "12"))))
+WEB3BIO_BATCH_WORKERS         = max(1, int(os.getenv("WEB3BIO_BATCH_WORKERS", "2")))
+WEB3BIO_BATCH_CACHE_SECONDS   = max(60, int(os.getenv("WEB3BIO_BATCH_CACHE_SECONDS", "3600")))
+WEB3BIO_BATCH_ERROR_SECONDS   = max(1, int(os.getenv("WEB3BIO_BATCH_ERROR_SECONDS", "15")))
+ENS_UNIVERSAL_TIMEOUT_SECONDS = max(3, int(os.getenv("ENS_UNIVERSAL_TIMEOUT_SECONDS", "12")))
+ENS_UNIVERSAL_CONCURRENCY     = max(1, int(os.getenv("ENS_UNIVERSAL_CONCURRENCY", "16")))
+CLUSTERS_API_KEY              = os.getenv("CLUSTERS_API_KEY", "")
+CLUSTERS_BATCH_SIZE           = max(1, int(os.getenv("CLUSTERS_BATCH_SIZE", "100")))
+CLUSTERS_BATCH_WORKERS        = max(1, int(os.getenv("CLUSTERS_BATCH_WORKERS", "2")))
+CLUSTERS_CACHE_SECONDS        = max(60, int(os.getenv("CLUSTERS_CACHE_SECONDS", "3600")))
+CLUSTERS_BATCH_TIMEOUT_SECONDS = max(3, int(os.getenv("CLUSTERS_BATCH_TIMEOUT_SECONDS", "15")))
+NAMESTONE_API_KEY             = os.getenv("NAMESTONE_API_KEY", "")
+NAMESTONE_PARENT_DOMAINS      = tuple(
+    value.strip().lower().lstrip(".")
+    for value in os.getenv("NAMESTONE_PARENT_DOMAINS", "").replace(";", ",").split(",")
+    if value.strip()
+)
 
 # ── GoldRush (Covalent) — суммарный баланс кошелька в USD ──────────────────────
 GOLDRUSH_API_KEY    = os.getenv("GOLDRUSH_API_KEY", "")
@@ -72,6 +105,12 @@ _FREE_PRICE_SEMAPHORE = asyncio.Semaphore(2)
 _WEB3BIO_SEMAPHORE = asyncio.Semaphore(WEB3BIO_CONCURRENCY)
 _WEB3BIO_RATE_LOCK = asyncio.Lock()
 _WEB3BIO_NEXT_REQUEST = 0.0
+_WEB3BIO_BATCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_WEB3BIO_BATCH_PENDING: dict[str, asyncio.Future] = {}
+_ENS_UNIVERSAL_SEMAPHORE = asyncio.Semaphore(ENS_UNIVERSAL_CONCURRENCY)
+_ENS_RPC_NEXT = 0
+_CLUSTERS_BATCH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_CLUSTERS_BATCH_PENDING: dict[str, asyncio.Future] = {}
 
 _SEARCH_CACHE:    dict[str, tuple[float, dict]] = {}
 _BULK_SEARCH_CACHE: dict[str, tuple[float, dict]] = {}
@@ -205,18 +244,44 @@ class _TrackedClient:
         self.available_responses = 0
         self.status_counts: dict[int, int] = {}
         self.exception_count = 0
+        self.circuit_open_count = 0
 
     async def _request_once(self, method: str, *args, **kwargs):
+        url = str(args[0]) if args else str(kwargs.get("url", ""))
+        source = urlparse(url).netloc.lower() or "unknown"
+        try:
+            await before_source_request(source)
+        except SourceCircuitOpen:
+            self.exception_count += 1
+            self.circuit_open_count += 1
+            raise
         self.attempts += 1
+        started = time.perf_counter()
         try:
             response = await getattr(self.client, method)(*args, **kwargs)
-        except Exception:
+        except Exception as exc:
             self.exception_count += 1
+            await report_source_result(
+                source,
+                error=type(exc).__name__,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
             raise
         status = response.status_code
         self.status_counts[status] = self.status_counts.get(status, 0) + 1
-        if status < 400 or status == 404:
+        if status < 500 and status not in (408, 425, 429):
             self.available_responses += 1
+        retry_after = response.headers.get("Retry-After")
+        try:
+            retry_after_value = float(retry_after) if retry_after else None
+        except (TypeError, ValueError):
+            retry_after_value = None
+        await report_source_result(
+            source,
+            status=status,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+            retry_after=retry_after_value,
+        )
         return response
 
     async def _request(self, method: str, *args, **kwargs):
@@ -230,6 +295,8 @@ class _TrackedClient:
                 response = await self._request_once(method, *args, **kwargs)
             if response.status_code != 429 or attempt >= WEB3BIO_429_RETRIES:
                 return response
+            source = urlparse(url).netloc.lower() or "unknown"
+            record_source_retry(source)
             retry_after = response.headers.get("Retry-After", "")
             try:
                 delay = max(float(retry_after), 0.25)
@@ -249,6 +316,16 @@ class _TrackedClient:
     def unavailable(self) -> bool:
         return self.attempts > 0 and self.available_responses == 0
 
+    @property
+    def had_temporary_failure(self) -> bool:
+        return bool(
+            self.exception_count
+            or any(
+                status in (408, 425, 429) or status >= 500
+                for status in self.status_counts
+            )
+        )
+
 
 def web3bio_headers() -> dict:
     if not WEB3BIO_API_KEY:
@@ -266,6 +343,8 @@ def extract_username(raw: str) -> Optional[str]:
     raw = raw.strip().rstrip("/")
     for suffix in DOMAIN_SUFFIXES:
         if raw.lower().endswith(suffix):
+            if raw.count(".") >= 2:
+                return raw.lower()
             raw = raw[:-len(suffix)]
             break
     if raw.startswith("@"):
@@ -312,7 +391,396 @@ def get_variants(username: str) -> dict:
         if clean_dash != clean and suffix in [".eth", ".crypto", ".nft", ".wallet", ".x"]:
             domains.append(f"{clean_dash}{suffix}")
 
-    return {"base": base, "domains": domains, "clean": clean}
+    if any(ul.endswith(suffix) for suffix in DOMAIN_SUFFIXES):
+        domains = [ul] + domains
+
+    return {"base": base, "domains": list(dict.fromkeys(domains)), "clean": clean}
+
+
+def _web3bio_batch_key(username: str) -> str:
+    return username.strip().lower()
+
+
+def _web3bio_batch_query_ids(username: str) -> list[str]:
+    """Build exact platform IDs accepted by the Web3.bio batch endpoint."""
+    raw = username.strip().lower().lstrip("@").rstrip("/")
+    dotted = raw.replace("_", ".")
+    if dotted.endswith(".base.eth"):
+        return [f"basenames,{dotted}"]
+    if dotted.endswith(".linea.eth"):
+        return [f"linea,{dotted}"]
+    if dotted.endswith(".eth"):
+        return [f"ens,{dotted}"]
+    if dotted.endswith(".lens"):
+        return [f"lens,{dotted}"]
+    # The batch endpoint becomes very slow on large miss-heavy candidate sets.
+    # Generic usernames are covered by the dedicated ENS/Farcaster/Lens/Base
+    # checkers; exact domain-like input still uses the batch endpoint.
+    return []
+
+
+def _web3bio_profile_query_ids(profile: dict) -> set[str]:
+    query_ids = {
+        str(alias).strip().lower()
+        for alias in profile.get("aliases") or []
+        if isinstance(alias, str) and "," in alias
+    }
+    platform = str(profile.get("platform") or "").strip().lower()
+    identity = str(profile.get("identity") or profile.get("handle") or "").strip().lower()
+    if platform and identity:
+        query_ids.add(f"{platform},{identity}")
+    return query_ids
+
+
+def _web3bio_cached_entry(username: str, *, allow_error: bool = True) -> dict[str, Any] | None:
+    key = _web3bio_batch_key(username)
+    cached = _WEB3BIO_BATCH_CACHE.get(key)
+    if not cached:
+        return None
+    created, entry = cached
+    ttl = WEB3BIO_BATCH_ERROR_SECONDS if entry.get("error") else WEB3BIO_BATCH_CACHE_SECONDS
+    if time.time() - created > ttl or (entry.get("error") and not allow_error):
+        _WEB3BIO_BATCH_CACHE.pop(key, None)
+        return None
+    return entry
+
+
+async def _get_web3bio_prefetch(username: str) -> dict[str, Any] | None:
+    key = _web3bio_batch_key(username)
+    pending = _WEB3BIO_BATCH_PENDING.get(key)
+    if pending:
+        try:
+            await asyncio.shield(pending)
+        except Exception:
+            log.debug("web3bio prefetch wait failed username=%s", username, exc_info=True)
+    return _web3bio_cached_entry(username)
+
+
+def _store_web3bio_batch_entry(key: str, entry: dict[str, Any]):
+    _WEB3BIO_BATCH_CACHE[key] = (time.time(), entry)
+    future = _WEB3BIO_BATCH_PENDING.pop(key, None)
+    if future and not future.done():
+        future.set_result(entry)
+    if len(_WEB3BIO_BATCH_CACHE) > 30000:
+        oldest = sorted(_WEB3BIO_BATCH_CACHE.items(), key=lambda item: item[1][0])[:5000]
+        for old_key, _ in oldest:
+            _WEB3BIO_BATCH_CACHE.pop(old_key, None)
+
+
+async def _run_web3bio_bulk_prefetch(records: list[tuple[str, str, list[str]]]):
+    states: dict[str, dict[str, Any]] = {
+        key: {
+            "profiles": [],
+            "errors": [],
+            "query_ids": query_ids,
+            "remaining": set(query_ids),
+            "done": False,
+        }
+        for _, key, query_ids in records
+    }
+    owners: dict[str, set[str]] = {}
+    for _, key, query_ids in records:
+        for query_id in query_ids:
+            owners.setdefault(query_id, set()).add(key)
+    all_query_ids = list(owners)
+
+    def finish_ready(key: str):
+        state = states[key]
+        if state["done"] or state["remaining"]:
+            return
+        unique_profiles = []
+        seen = set()
+        for profile in state["profiles"]:
+            profile_key = (
+                str(profile.get("platform") or "").lower(),
+                str(profile.get("identity") or "").lower(),
+                str(profile.get("address") or "").lower(),
+            )
+            if profile_key in seen:
+                continue
+            seen.add(profile_key)
+            unique_profiles.append(profile)
+        errors = list(dict.fromkeys(state["errors"]))
+        state["done"] = True
+        _store_web3bio_batch_entry(key, {
+            "profiles": unique_profiles,
+            "query_ids": state["query_ids"],
+            "complete": not errors,
+            "error": ",".join(errors) if errors else None,
+            "batch": True,
+        })
+
+    fatal_error = None
+
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as raw_client:
+            client = _TrackedClient(raw_client)
+            batch_slots = asyncio.Semaphore(WEB3BIO_BATCH_WORKERS)
+
+            async def process_chunk(chunk: list[str]):
+                async with batch_slots:
+                    chunk_set = set(chunk)
+                    error = None
+                    profiles: list[dict] = []
+                    try:
+                        encoded = quote(json.dumps(chunk, separators=(",", ":")), safe="")
+                        response = await client.get(
+                            f"https://api.web3.bio/ns/batch/{encoded}",
+                            headers=web3bio_headers(),
+                            timeout=20,
+                        )
+                        if response.status_code == 200:
+                            payload = response.json()
+                            profiles = payload if isinstance(payload, list) else []
+                        elif response.status_code == 404:
+                            profiles = []
+                        else:
+                            error = f"web3bio_batch_http_{response.status_code}"
+                    except SourceCircuitOpen:
+                        error = "circuit_open"
+                    except httpx.TimeoutException:
+                        error = "web3bio_batch_timeout"
+                    except Exception as exc:
+                        error = f"web3bio_batch_{type(exc).__name__}"
+
+                    if error:
+                        for query_id in chunk:
+                            for key in owners.get(query_id, ()):
+                                states[key]["errors"].append(error)
+                    else:
+                        profiles_by_query: dict[str, list[dict]] = {
+                            query_id: [] for query_id in chunk
+                        }
+                        for profile in profiles:
+                            if not isinstance(profile, dict) or profile.get("error"):
+                                continue
+                            for query_id in _web3bio_profile_query_ids(profile) & chunk_set:
+                                profiles_by_query[query_id].append(profile)
+                        for query_id, matched_profiles in profiles_by_query.items():
+                            for key in owners.get(query_id, ()):
+                                states[key]["profiles"].extend(matched_profiles)
+
+                    for query_id in chunk:
+                        for key in owners.get(query_id, ()):
+                            states[key]["remaining"].discard(query_id)
+                            finish_ready(key)
+
+            await asyncio.gather(*(
+                process_chunk(all_query_ids[offset:offset + WEB3BIO_BATCH_SIZE])
+                for offset in range(0, len(all_query_ids), WEB3BIO_BATCH_SIZE)
+            ))
+    except asyncio.CancelledError:
+        fatal_error = "web3bio_batch_cancelled"
+        raise
+    except Exception as exc:
+        fatal_error = f"web3bio_batch_{type(exc).__name__}"
+    finally:
+        for key, state in states.items():
+            if state["done"]:
+                continue
+            state["errors"].append(fatal_error or "web3bio_batch_incomplete")
+            state["remaining"].clear()
+            finish_ready(key)
+
+
+def start_web3bio_bulk_prefetch(usernames: list[str], *, force_errors: bool = False) -> asyncio.Task | None:
+    """Prime Web3.bio in batches of 30 while bulk workers consume earlier batches."""
+    loop = asyncio.get_running_loop()
+    records: list[tuple[str, str, list[str]]] = []
+    seen = set()
+    for username in usernames:
+        key = _web3bio_batch_key(username)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        cached = _web3bio_cached_entry(username, allow_error=not force_errors)
+        if cached or key in _WEB3BIO_BATCH_PENDING:
+            continue
+        query_ids = _web3bio_batch_query_ids(username)
+        if not query_ids:
+            _store_web3bio_batch_entry(key, {
+                "profiles": [], "query_ids": [], "complete": True,
+                "error": None, "batch": True,
+            })
+            continue
+        _WEB3BIO_BATCH_PENDING[key] = loop.create_future()
+        records.append((username, key, query_ids))
+    if not records:
+        return None
+    return loop.create_task(_run_web3bio_bulk_prefetch(records))
+
+
+def _clusters_names(username: str) -> list[str]:
+    variants = get_variants(username)
+    return list(dict.fromkeys(
+        str(value).strip().lower()
+        for value in variants["base"]
+        if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(value).strip())
+    ))[:4]
+
+
+def _clusters_cached_entry(username: str, *, allow_error: bool = True) -> dict[str, Any] | None:
+    key = _cache_key(username)
+    cached = _CLUSTERS_BATCH_CACHE.get(key)
+    if not cached:
+        return None
+    created, entry = cached
+    ttl = WEB3BIO_BATCH_ERROR_SECONDS if entry.get("error") else CLUSTERS_CACHE_SECONDS
+    if time.time() - created > ttl or (entry.get("error") and not allow_error):
+        _CLUSTERS_BATCH_CACHE.pop(key, None)
+        return None
+    return entry
+
+
+async def _get_clusters_prefetch(username: str) -> dict[str, Any] | None:
+    key = _cache_key(username)
+    pending = _CLUSTERS_BATCH_PENDING.get(key)
+    if pending:
+        try:
+            await asyncio.shield(pending)
+        except Exception:
+            log.debug("clusters prefetch wait failed username=%s", username, exc_info=True)
+    return _clusters_cached_entry(username)
+
+
+def _store_clusters_entry(key: str, entry: dict[str, Any]):
+    _CLUSTERS_BATCH_CACHE[key] = (time.time(), entry)
+    future = _CLUSTERS_BATCH_PENDING.pop(key, None)
+    if future and not future.done():
+        future.set_result(entry)
+    if len(_CLUSTERS_BATCH_CACHE) > 30000:
+        oldest = sorted(_CLUSTERS_BATCH_CACHE.items(), key=lambda item: item[1][0])[:5000]
+        for old_key, _ in oldest:
+            _CLUSTERS_BATCH_CACHE.pop(old_key, None)
+
+
+def _clusters_headers() -> dict[str, str]:
+    headers = {**HEADERS, "Content-Type": "application/json"}
+    if CLUSTERS_API_KEY:
+        headers["X-API-KEY"] = CLUSTERS_API_KEY
+    return headers
+
+
+async def _run_clusters_bulk_prefetch(records: list[tuple[str, str, list[str]]]):
+    states: dict[str, dict[str, Any]] = {
+        key: {
+            "records": [],
+            "errors": [],
+            "names": names,
+            "remaining": set(names),
+            "done": False,
+        }
+        for _, key, names in records
+    }
+    owners: dict[str, set[str]] = {}
+    for _, key, names in records:
+        for name in names:
+            owners.setdefault(name, set()).add(key)
+    all_names = list(owners)
+
+    def finish_ready(key: str):
+        state = states[key]
+        if state["done"] or state["remaining"]:
+            return
+        errors = list(dict.fromkeys(state["errors"]))
+        state["done"] = True
+        _store_clusters_entry(key, {
+            "records": state["records"],
+            "names": state["names"],
+            "complete": not errors,
+            "error": ",".join(errors) if errors else None,
+            "batch": True,
+        })
+
+    fatal_error = None
+
+    try:
+        async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=CLUSTERS_BATCH_TIMEOUT_SECONDS) as raw_client:
+            client = _TrackedClient(raw_client)
+            batch_slots = asyncio.Semaphore(CLUSTERS_BATCH_WORKERS)
+
+            async def process_chunk(chunk: list[str]):
+                async with batch_slots:
+                    error = None
+                    payload: list[dict] = []
+                    try:
+                        response = await client.post(
+                            "https://api.clusters.xyz/v1/names",
+                            json=[{"name": name} for name in chunk],
+                            headers=_clusters_headers(),
+                            timeout=CLUSTERS_BATCH_TIMEOUT_SECONDS,
+                        )
+                        if response.status_code == 200:
+                            data = response.json()
+                            payload = data if isinstance(data, list) else []
+                        else:
+                            error = f"clusters_http_{response.status_code}"
+                    except SourceCircuitOpen:
+                        error = "circuit_open"
+                    except httpx.TimeoutException:
+                        error = "clusters_timeout"
+                    except Exception as exc:
+                        error = f"clusters_{type(exc).__name__}"
+
+                    if error:
+                        for name in chunk:
+                            for key in owners.get(name, ()):
+                                states[key]["errors"].append(error)
+                    else:
+                        for item in payload:
+                            if not isinstance(item, dict):
+                                continue
+                            name = str(item.get("name") or "").strip().lower()
+                            for key in owners.get(name, ()):
+                                states[key]["records"].append(item)
+
+                    for name in chunk:
+                        for key in owners.get(name, ()):
+                            states[key]["remaining"].discard(name)
+                            finish_ready(key)
+
+            await asyncio.gather(*(
+                process_chunk(all_names[offset:offset + CLUSTERS_BATCH_SIZE])
+                for offset in range(0, len(all_names), CLUSTERS_BATCH_SIZE)
+            ))
+    except asyncio.CancelledError:
+        fatal_error = "clusters_batch_cancelled"
+        raise
+    except Exception as exc:
+        fatal_error = f"clusters_{type(exc).__name__}"
+    finally:
+        for key, state in states.items():
+            if state["done"]:
+                continue
+            state["errors"].append(fatal_error or "clusters_batch_incomplete")
+            state["remaining"].clear()
+            finish_ready(key)
+
+
+def start_clusters_bulk_prefetch(usernames: list[str], *, force_errors: bool = False) -> asyncio.Task | None:
+    loop = asyncio.get_running_loop()
+    records: list[tuple[str, str, list[str]]] = []
+    seen = set()
+    for username in usernames:
+        key = _cache_key(username)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        cached = _clusters_cached_entry(username, allow_error=not force_errors)
+        if cached or key in _CLUSTERS_BATCH_PENDING:
+            continue
+        names = _clusters_names(username)
+        if not names:
+            _store_clusters_entry(key, {
+                "records": [], "names": [], "complete": True,
+                "error": None, "batch": True,
+            })
+            continue
+        _CLUSTERS_BATCH_PENDING[key] = loop.create_future()
+        records.append((username, key, names))
+    if not records:
+        return None
+    return loop.create_task(_run_clusters_bulk_prefetch(records))
 
 
 # ─── НАДЁЖНЫЕ ЧЕКЕРЫ (только API, не HTML парсинг) ───────────────────────────
@@ -344,7 +812,7 @@ async def check_farcaster(client, username, variants):
                         "url": f"https://warpcast.com/{v}", "matched": v,
                         "wallets": wallets, "extra": {"имя": user.get("displayName", "")}}
         except Exception:
-            pass
+            log.debug("farcaster check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Farcaster", "emoji": "🔵"}
 
 
@@ -387,7 +855,7 @@ async def check_unstoppable(client, username, variants):
                             "url": f"https://unstoppabledomains.com/d/{name}", "matched": name,
                             "wallets": [owner], "extra": {"домен": name}}
         except Exception:
-            pass
+            log.debug("unstoppable check failed domain=%s", name, exc_info=True)
     return {"found": False, "platform": "Unstoppable Domains", "emoji": "🔓"}
 
 
@@ -418,7 +886,7 @@ async def check_lens(client, username, variants):
                                 "wallets": [wallet],
                                 "extra": {"имя": (profile.get("metadata") or {}).get("displayName", "")}}
         except Exception:
-            pass
+            log.debug("lens check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Lens Protocol", "emoji": "🌿"}
 
 
@@ -441,12 +909,56 @@ async def check_spaceid(client, username, variants):
                             "url": f"https://space.id/profile/{name}", "matched": name,
                             "wallets": [addr], "extra": {"домен": name}}
         except Exception:
-            pass
+            log.debug("spaceid check failed domain=%s", name, exc_info=True)
     return {"found": False, "platform": "SPACE ID (.bnb/.arb)", "emoji": "🔶"}
 
 
 async def check_web3bio(client, username, variants):
     """Web3.bio — строго проверяем что найденный handle совпадает с ником"""
+    prefetched = await _get_web3bio_prefetch(username)
+    if prefetched is not None:
+        batch_checked = any(
+            str(query_id).startswith("basenames,")
+            for query_id in prefetched.get("query_ids") or []
+        )
+        profiles = [
+            profile
+            for profile in prefetched.get("profiles") or []
+            if str(profile.get("platform") or "").lower() not in ("basenames", "basename")
+        ]
+        wallets = list(dict.fromkeys(
+            str(profile.get("address") or "").strip()
+            for profile in profiles
+            if profile.get("address") and is_real_wallet(str(profile.get("address")))
+        ))
+        if wallets:
+            identities = list(dict.fromkeys(
+                str(profile.get("identity") or profile.get("handle") or "").strip()
+                for profile in profiles
+                if profile.get("identity") or profile.get("handle")
+            ))
+            result = {
+                "found": True,
+                "platform": "Web3.bio",
+                "emoji": "🌐",
+                "url": f"https://web3.bio/{identities[0] if identities else username}",
+                "matched": identities[0] if identities else username,
+                "wallets": wallets[:10],
+                "extra": {"profiles": " | ".join(identities)[:200]},
+                "batch_hit": True,
+            }
+            if prefetched.get("error"):
+                result["error"] = prefetched["error"]
+            return result
+        return {
+            "found": False,
+            "platform": "Web3.bio",
+            "emoji": "🌐",
+            "wallets": [],
+            "error": prefetched.get("error"),
+            "batch_hit": True,
+        }
+
     for v in variants["base"][:3]:
         try:
             r = await client.get(f"https://api.web3.bio/profile/{v}", headers=web3bio_headers(), timeout=10)
@@ -475,7 +987,7 @@ async def check_web3bio(client, username, variants):
                         "url": f"https://web3.bio/{v}", "matched": v,
                         "wallets": wallets[:3], "extra": {"профили": info}}
         except Exception:
-            pass
+            log.debug("web3bio check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Web3.bio", "emoji": "🌐"}
 
 
@@ -503,7 +1015,7 @@ async def check_github(client, username, variants):
                 return {"found": False, "platform": "GitHub", "emoji": "🐙",
                         "profile": {"url": data.get("html_url"), "matched": v}}
         except Exception:
-            pass
+            log.debug("github check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "GitHub", "emoji": "🐙"}
 
 
@@ -522,7 +1034,7 @@ async def check_gitcoin(client, username, variants):
                             "wallets": [addr] if addr else [],
                             "extra": {"имя": data.get("name", "")}}
         except Exception:
-            pass
+            log.debug("gitcoin check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Gitcoin", "emoji": "💚"}
 
 
@@ -546,7 +1058,7 @@ async def check_snapshot(client, username, variants):
                             "url": f"https://snapshot.org/#/{s['id']}", "matched": v,
                             "wallets": admins[:3], "extra": {"DAO": s.get("name", "")}}
         except Exception:
-            pass
+            log.debug("snapshot check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Snapshot (DAO)", "emoji": "📸"}
 
 
@@ -602,7 +1114,7 @@ async def _rev_ens(client, address):
                         "url": f"https://app.ens.domains/{names[0]}",
                         "handles": names, "extra": {}}
     except Exception:
-        pass
+        log.debug("reverse ENS lookup failed address=%s", address, exc_info=True)
     return {"found": False}
 
 
@@ -618,7 +1130,7 @@ async def _rev_farcaster(client, address):
                         "url": f"https://warpcast.com/{user.get('username','')}",
                         "handles": [user.get("username", "")], "extra": {}}
     except Exception:
-        pass
+        log.debug("reverse Farcaster lookup failed address=%s", address, exc_info=True)
     return {"found": False}
 
 
@@ -639,7 +1151,7 @@ async def _rev_lens(client, address):
                         "url": f"https://hey.xyz/u/{handles[0]}",
                         "handles": handles, "extra": {}}
     except Exception:
-        pass
+        log.debug("reverse Lens lookup failed address=%s", address, exc_info=True)
     return {"found": False}
 
 
@@ -655,7 +1167,7 @@ async def _rev_web3bio(client, address):
                         "url": f"https://web3.bio/{address}",
                         "handles": handles, "extra": {}}
     except Exception:
-        pass
+        log.debug("reverse Web3.bio lookup failed address=%s", address, exc_info=True)
     return {"found": False}
 
 
@@ -713,7 +1225,7 @@ async def check_opensea_html(client, username, variants):
                             "url": f"https://opensea.io/{v}", "matched": v,
                             "wallets": addrs[:2], "extra": {}}
         except Exception:
-            pass
+            log.debug("opensea html check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "OpenSea", "emoji": "🌊"}
 
 
@@ -732,7 +1244,7 @@ async def check_blur_api(client, username, variants):
                             "url": f"https://blur.io/user/{v}", "matched": v,
                             "wallets": [addr], "extra": {}}
         except Exception:
-            pass
+            log.debug("blur check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Blur", "emoji": "💎"}
 
 
@@ -754,7 +1266,7 @@ async def check_rainbow_html(client, username, variants):
                             "wallets": addrs[:3],
                             "extra": {"ens": ens_m.group(1) if ens_m else None}}
         except Exception:
-            pass
+            log.debug("rainbow html check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Rainbow", "emoji": "🌈"}
 
 
@@ -774,28 +1286,8 @@ async def check_zapper_html(client, username, variants):
                             "url": f"https://zapper.xyz/account/{v}", "matched": v,
                             "wallets": addrs[:3], "extra": {}}
         except Exception:
-            pass
+            log.debug("zapper html check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "Zapper", "emoji": "⚡"}
-
-
-# ─── Retry helper ────────────────────────────────────────────────────────────
-
-async def _retry(coro_fn, retries=3, base_delay=1.0):
-    """Повторяет запрос при 429/5xx или timeout с exponential backoff"""
-    for attempt in range(retries):
-        try:
-            return await coro_fn()
-        except httpx.TimeoutException:
-            if attempt < retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code in (429, 500, 502, 503) and attempt < retries - 1:
-                await asyncio.sleep(base_delay * (2 ** attempt))
-            else:
-                raise
-        except Exception:
-            raise
-    return None
 
 
 # ─── Новые чекеры ────────────────────────────────────────────────────────────
@@ -824,17 +1316,93 @@ async def check_opensea_v2(client, username, variants):
                         }
                     }
         except Exception:
-            pass
+            log.debug("opensea API check failed variant=%s", v, exc_info=True)
     return {"found": False, "platform": "OpenSea", "emoji": "🌊"}
 
 
 async def check_basename(client, username, variants):
-    """Base Names (.base.eth) через Web3.bio, без старого ENS subgraph."""
+    """Resolve Base Names through Universal Resolver, with Web3.bio fallback."""
     candidates = []
+    explicit = str(variants.get("explicit_domain") or "").lower()
+    if explicit.endswith(".base.eth"):
+        candidates.append(explicit)
     for v in [variants.get("clean")] + variants["base"][:2]:
-        if v:
-            candidates.append(f"{v}.base.eth")
-    for name in list(dict.fromkeys(candidates))[:3]:
+        value = str(v or "").strip().lower()
+        if value:
+            candidates.append(f"{value}.base.eth")
+    candidates = list(dict.fromkeys(candidates))[:3]
+
+    resolver_available = False
+    resolver_errors = []
+    for name in candidates:
+        wallet, error, available = await _resolve_ens_universal(name)
+        resolver_available = resolver_available or available
+        if wallet:
+            return {
+                "found": True,
+                "platform": "Base Names",
+                "emoji": "🔵",
+                "url": f"https://www.base.org/name/{name[:-9]}",
+                "matched": name,
+                "wallets": [wallet],
+                "extra": {"domain": name, "source": "universal_resolver"},
+                "source_available": True,
+            }
+        if error:
+            resolver_errors.append(error)
+
+    prefetched = await _get_web3bio_prefetch(username)
+    if prefetched is not None:
+        profiles = [
+            profile
+            for profile in prefetched.get("profiles") or []
+            if str(profile.get("platform") or "").lower() in ("basenames", "basename")
+            or str(profile.get("identity") or "").lower().endswith(".base.eth")
+        ]
+        for profile in profiles:
+            name = str(profile.get("identity") or profile.get("handle") or "").lower()
+            wallet = str(profile.get("address") or "").strip()
+            if name.endswith(".base.eth") and wallet and is_real_wallet(wallet):
+                result = {
+                    "found": True,
+                    "platform": "Base Names",
+                    "emoji": "🔵",
+                    "url": f"https://www.base.org/name/{name[:-9]}",
+                    "matched": name,
+                    "wallets": [wallet],
+                    "extra": {"domain": name},
+                    "batch_hit": True,
+                }
+                if prefetched.get("error"):
+                    result["error"] = prefetched["error"]
+                return result
+        result = {
+            "found": False,
+            "platform": "Base Names",
+            "emoji": "🔵",
+            "wallets": [],
+            "batch_hit": True,
+            "source_available": resolver_available or (
+                batch_checked and bool(prefetched.get("complete"))
+            ),
+        }
+        if not result["source_available"]:
+            result["error"] = (
+                prefetched.get("error")
+                or ",".join(dict.fromkeys(resolver_errors))
+                or "basename_source_unavailable"
+            )
+        return result
+
+    if resolver_available:
+        return {
+            "found": False,
+            "platform": "Base Names",
+            "emoji": "🔵",
+            "source_available": True,
+        }
+
+    for name in candidates:
         try:
             r = await client.get(
                 f"https://api.web3.bio/ns/basenames/{name}",
@@ -854,33 +1422,10 @@ async def check_basename(client, username, variants):
                         }
         except Exception:
             log.debug("basename check failed name=%s", name, exc_info=True)
-    return {"found": False, "platform": "Base Names", "emoji": "🔵"}
-
-
-async def check_friendtech(client, username, variants):
-    """friend.tech — связывает Twitter username с Base кошельком"""
-    for v in variants["base"][:3]:
-        try:
-            r = await client.get(
-                f"https://prod-api.kosetto.com/users/{v}",
-                headers={**HEADERS, "Authorization": ""},
-                timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                addr = data.get("address")
-                if addr and is_real_wallet(addr):
-                    return {
-                        "found": True, "platform": "friend.tech", "emoji": "👥",
-                        "url": f"https://friend.tech/rooms/{addr}", "matched": v,
-                        "wallets": [addr],
-                        "extra": {
-                            "twitter": data.get("twitterUsername", ""),
-                            "name": data.get("twitterName", ""),
-                        }
-                    }
-        except Exception:
-            pass
-    return {"found": False, "platform": "friend.tech", "emoji": "👥"}
+    result = {"found": False, "platform": "Base Names", "emoji": "🔵"}
+    if resolver_errors:
+        result["error"] = ",".join(dict.fromkeys(resolver_errors))[:200]
+    return result
 
 
 async def check_aptos_names(client, username, variants):
@@ -902,7 +1447,7 @@ async def check_aptos_names(client, username, variants):
                         "wallets": [addr], "extra": {"domain": name}
                     }
         except Exception:
-            pass
+            log.debug("aptos names check failed domain=%s", name, exc_info=True)
     return {"found": False, "platform": "Aptos Names (.apt)", "emoji": "🟦"}
 
 
@@ -925,73 +1470,346 @@ async def check_sui_names(client, username, variants):
                         "wallets": [addr], "extra": {"domain": name}
                     }
         except Exception:
-            pass
+            log.debug("sui names check failed domain=%s", name, exc_info=True)
     return {"found": False, "platform": "Sui Names (.sui)", "emoji": "🌀"}
 
 
 # ─── Список всех платформ (после всех функций) ───────────────────────────────
 
-async def check_ens(client, username, variants):
-    """ENS lookup with multiple free fallbacks for unstable public endpoints."""
-    eth_names = [d for d in variants["domains"] if d.endswith(".eth")]
-    for name in eth_names[:3]:
+def _ens_rpc_urls() -> list[str]:
+    defaults = ["https://ethereum-rpc.publicnode.com", "https://eth.drpc.org"]
+    return _rpc_urls("ENS_RPC_URLS", _rpc_urls("ETH_RPC_URLS", defaults))
+
+
+def _rotated_ens_rpc_urls() -> list[str]:
+    global _ENS_RPC_NEXT
+    urls = _ens_rpc_urls()
+    if len(urls) < 2:
+        return urls
+    index = _ENS_RPC_NEXT % len(urls)
+    _ENS_RPC_NEXT += 1
+    return urls[index:] + urls[:index]
+
+
+async def _resolve_ens_universal(name: str) -> tuple[str | None, str | None, bool]:
+    """Resolve through web3.py's Universal Resolver with CCIP Read support."""
+    if AsyncWeb3 is None or AsyncHTTPProvider is None:
+        return None, "web3_not_installed", False
+
+    errors = []
+    for rpc_url in _rotated_ens_rpc_urls():
+        source = urlparse(rpc_url).netloc.lower() or "ens_rpc"
         try:
-            r = await client.post(
+            await before_source_request(source)
+        except SourceCircuitOpen:
+            errors.append("circuit_open")
+            continue
+
+        started = time.perf_counter()
+        provider = None
+        try:
+            async with _ENS_UNIVERSAL_SEMAPHORE:
+                provider = AsyncHTTPProvider(
+                    rpc_url,
+                    request_kwargs={"timeout": ENS_UNIVERSAL_TIMEOUT_SECONDS},
+                )
+                w3 = AsyncWeb3(provider)
+                wallet = await asyncio.wait_for(
+                    w3.ens.address(name),
+                    timeout=ENS_UNIVERSAL_TIMEOUT_SECONDS,
+                )
+            await report_source_result(
+                source,
+                status=200,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+            if wallet and is_real_wallet(str(wallet)):
+                return str(wallet).lower(), None, True
+            return None, None, True
+        except Exception as exc:
+            if type(exc).__name__ in ("InvalidName", "ENSValidationError"):
+                await report_source_result(
+                    source,
+                    status=200,
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                )
+                return None, None, True
+            error = "timeout" if isinstance(exc, asyncio.TimeoutError) else type(exc).__name__
+            errors.append(error)
+            await report_source_result(
+                source,
+                error=error,
+                latency_ms=int((time.perf_counter() - started) * 1000),
+            )
+        finally:
+            disconnect = getattr(provider, "disconnect", None)
+            if disconnect:
+                try:
+                    await disconnect()
+                except Exception:
+                    log.debug("ENS provider disconnect failed rpc=%s", rpc_url, exc_info=True)
+    return None, "ens_universal_unavailable:" + ",".join(dict.fromkeys(errors)), False
+
+
+async def check_ens(client, username, variants):
+    """ENS with a fast indexed path plus canonical Universal Resolver fallback."""
+    eth_names = list(dict.fromkeys(
+        str(domain).lower()
+        for domain in variants["domains"]
+        if str(domain).lower().endswith(".eth")
+    ))[:3]
+    source_available = False
+    temporary_errors = []
+
+    for index, name in enumerate(eth_names):
+        universal_first = index == 0 and (
+            name.count(".") >= 2 or name == variants.get("explicit_domain")
+        )
+        universal_checked = False
+        if universal_first:
+            wallet, error, available = await _resolve_ens_universal(name)
+            universal_checked = True
+            source_available = source_available or available
+            if wallet:
+                return {
+                    "found": True, "platform": "ENS (.eth)", "emoji": "🔷",
+                    "url": f"https://app.ens.domains/{name}", "matched": name,
+                    "wallets": [wallet],
+                    "extra": {"domain": name, "source": "universal_resolver"},
+                    "source_available": True,
+                }
+            if error:
+                temporary_errors.append(error)
+
+        graph_available = False
+        try:
+            response = await client.post(
                 "https://api.thegraph.com/subgraphs/name/ensdomains/ens",
                 json={"query": f'{{domains(where:{{name:"{name}"}}){{name owner{{id}} resolvedAddress{{id}}}}}}'},
                 timeout=10,
             )
-            if r.status_code == 200:
-                payload = r.json()
+            if response.status_code == 200:
+                payload = response.json()
                 graph_data = payload.get("data")
-                doms = graph_data.get("domains") if isinstance(graph_data, dict) else None
-                if isinstance(doms, list) and doms:
-                    domain = doms[0]
-                    wallet = (domain.get("resolvedAddress") or {}).get("id") or (domain.get("owner") or {}).get("id")
-                    if wallet and is_real_wallet(wallet):
-                        return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
+                domains = graph_data.get("domains") if isinstance(graph_data, dict) else None
+                if isinstance(domains, list) and not payload.get("errors"):
+                    graph_available = True
+                    source_available = True
+                    if domains:
+                        domain = domains[0]
+                        wallet = ((domain.get("resolvedAddress") or {}).get("id")
+                                  or (domain.get("owner") or {}).get("id"))
+                        if wallet and is_real_wallet(wallet):
+                            return {
+                                "found": True, "platform": "ENS (.eth)", "emoji": "🔷",
                                 "url": f"https://app.ens.domains/{name}", "matched": name,
-                                "wallets": [wallet], "extra": {"domain": name, "source": "thegraph"}}
-                if isinstance(doms, list) and not payload.get("errors"):
-                    return {"found": False, "platform": "ENS (.eth)", "emoji": "🔷"}
-                log.debug("ens graph malformed response name=%s payload=%s", name, str(payload)[:200])
-            elif r.status_code in (429, 500, 502, 503, 504):
-                log.debug("ens graph temporary failure name=%s status=%s", name, r.status_code)
-        except Exception:
+                                "wallets": [wallet],
+                                "extra": {"domain": name, "source": "thegraph"},
+                                "source_available": True,
+                            }
+                else:
+                    temporary_errors.append("ens_graph_malformed")
+            elif response.status_code in (429, 500, 502, 503, 504):
+                temporary_errors.append(f"ens_graph_http_{response.status_code}")
+        except Exception as exc:
+            temporary_errors.append(f"ens_graph_{type(exc).__name__}")
             log.debug("ens graph check failed name=%s", name, exc_info=True)
 
-        try:
-            r = await client.get(f"https://api.ensideas.com/ens/resolve/{name}", timeout=8)
-            if r.status_code == 200:
-                wallet = r.json().get("address")
-                if wallet and is_real_wallet(wallet):
-                    return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
-                            "url": f"https://app.ens.domains/{name}", "matched": name,
-                            "wallets": [wallet], "extra": {"domain": name, "source": "ensideas"}}
-        except Exception:
-            log.debug("ensideas fallback failed name=%s", name, exc_info=True)
+        if not universal_checked:
+            wallet, error, available = await _resolve_ens_universal(name)
+            source_available = source_available or available
+            if wallet:
+                return {
+                    "found": True, "platform": "ENS (.eth)", "emoji": "🔷",
+                    "url": f"https://app.ens.domains/{name}", "matched": name,
+                    "wallets": [wallet],
+                    "extra": {"domain": name, "source": "universal_resolver"},
+                    "source_available": True,
+                }
+            if error:
+                temporary_errors.append(error)
 
+        if not graph_available and not source_available:
+            try:
+                response = await client.get(f"https://api.ensideas.com/ens/resolve/{name}", timeout=8)
+                if response.status_code in (200, 404):
+                    source_available = True
+                if response.status_code == 200:
+                    wallet = response.json().get("address")
+                    if wallet and is_real_wallet(wallet):
+                        return {
+                            "found": True, "platform": "ENS (.eth)", "emoji": "🔷",
+                            "url": f"https://app.ens.domains/{name}", "matched": name,
+                            "wallets": [wallet],
+                            "extra": {"domain": name, "source": "ensideas"},
+                            "source_available": True,
+                        }
+            except Exception as exc:
+                temporary_errors.append(f"ensideas_{type(exc).__name__}")
+
+    result = {
+        "found": False,
+        "platform": "ENS (.eth)",
+        "emoji": "🔷",
+        "source_available": source_available,
+    }
+    if temporary_errors and not source_available:
+        result["error"] = ",".join(dict.fromkeys(temporary_errors))[:200]
+    return result
+
+
+async def check_clusters(client, username, variants):
+    """Clusters.xyz same-name OSINT signal with verified public wallet members only."""
+    names = _clusters_names(username)
+    prefetched = await _get_clusters_prefetch(username)
+    error = None
+    if prefetched is not None:
+        records = prefetched.get("records") or []
+        error = prefetched.get("error")
+    else:
         try:
-            r = await client.get(
-                f"https://api.web3.bio/ns/ens/{name}",
-                headers=web3bio_headers(),
+            response = await client.post(
+                "https://api.clusters.xyz/v1/names",
+                json=[{"name": name} for name in names],
+                headers=_clusters_headers(),
+                timeout=CLUSTERS_BATCH_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                return {
+                    "found": False, "platform": "Clusters.xyz", "emoji": "🔗",
+                    "error": f"clusters_http_{response.status_code}",
+                }
+            payload = response.json()
+            records = payload if isinstance(payload, list) else []
+        except Exception:
+            log.debug("clusters lookup failed username=%s", username, exc_info=True)
+            return {"found": False, "platform": "Clusters.xyz", "emoji": "🔗"}
+
+    candidates = set(names)
+    matched_records = [
+        item for item in records
+        if isinstance(item, dict)
+        and str(item.get("name") or "").lower() in candidates
+        and item.get("isVerified") is True
+        and item.get("address")
+    ]
+    if not matched_records:
+        result = {"found": False, "platform": "Clusters.xyz", "emoji": "🔗"}
+        if error:
+            result["error"] = error
+        return result
+
+    cluster_names = list(dict.fromkeys(
+        str(item.get("clusterName") or item.get("name") or "").lower()
+        for item in matched_records
+        if item.get("clusterName") or item.get("name")
+    ))
+    wallets = [str(item.get("address")) for item in matched_records]
+    detail_error = None
+    for cluster_name in cluster_names[:2]:
+        try:
+            response = await client.get(
+                f"https://api.clusters.xyz/v1/clusters/name/{quote(cluster_name, safe='')}",
+                headers=_clusters_headers(),
+                timeout=CLUSTERS_BATCH_TIMEOUT_SECONDS,
+            )
+            if response.status_code == 200:
+                cluster = response.json()
+                for wallet in cluster.get("wallets") or []:
+                    if (wallet.get("isVerified") is True
+                            and wallet.get("isPrivate") is not True
+                            and wallet.get("address")):
+                        wallets.append(str(wallet["address"]))
+            elif response.status_code in (429, 500, 502, 503, 504):
+                detail_error = f"clusters_detail_http_{response.status_code}"
+        except Exception:
+            detail_error = "clusters_detail_unavailable"
+
+    wallets = list(dict.fromkeys(
+        wallet.lower() if is_eth_address(wallet) else wallet
+        for wallet in wallets
+        if (is_eth_address(wallet) or is_solana_address(wallet)) and is_real_wallet(wallet)
+    ))
+    if not wallets:
+        return {"found": False, "platform": "Clusters.xyz", "emoji": "🔗"}
+    matched = str(matched_records[0].get("name") or username)
+    result = {
+        "found": True,
+        "platform": "Clusters.xyz",
+        "emoji": "🔗",
+        "url": f"https://clusters.xyz/{cluster_names[0] if cluster_names else matched}",
+        "matched": matched,
+        "wallets": wallets,
+        "extra": {
+            "cluster": cluster_names[0] if cluster_names else matched,
+            "verified_members": len(wallets),
+            "signal": "same_name_cluster",
+        },
+        "batch_hit": prefetched is not None,
+    }
+    combined_error = error or detail_error
+    if combined_error:
+        result["error"] = combined_error
+    return result
+
+
+async def check_namestone(client, username, variants):
+    """Optional NameStone API enrichment for exact/configured offchain subdomains."""
+    if not NAMESTONE_API_KEY:
+        return {"found": False, "platform": "NameStone", "emoji": "🪨"}
+
+    candidates = [
+        str(name).lower()
+        for name in variants.get("domains") or []
+        if str(name).count(".") >= 2
+    ]
+    labels = [
+        str(value).lower()
+        for value in variants.get("base") or []
+        if re.fullmatch(r"[a-z0-9-]+", str(value).lower())
+    ][:3]
+    for parent in NAMESTONE_PARENT_DOMAINS:
+        candidates.extend(f"{label}.{parent}" for label in labels)
+
+    headers = {**HEADERS, "Authorization": NAMESTONE_API_KEY}
+    for name in list(dict.fromkeys(candidates))[:12]:
+        try:
+            response = await client.get(
+                "https://namestone.com/api/public_v1/get-domain",
+                params={"domain": name},
+                headers=headers,
                 timeout=10,
             )
-            if r.status_code == 200:
-                data = r.json()
-                profiles = data if isinstance(data, list) else [data]
-                for profile in profiles:
-                    identity = (profile.get("identity") or profile.get("handle") or "").lower()
-                    platform = (profile.get("platform") or "").lower()
-                    wallet = profile.get("address")
-                    if identity == name.lower() and platform == "ens" and wallet and is_real_wallet(wallet):
-                        return {"found": True, "platform": "ENS (.eth)", "emoji": "🔷",
-                                "url": f"https://app.ens.domains/{name}", "matched": name,
-                                "wallets": [wallet], "extra": {"domain": name, "source": "web3.bio"}}
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            entries = payload if isinstance(payload, list) else [payload]
+            for entry in entries:
+                domain = str(entry.get("domain") or "").lower()
+                if domain != name:
+                    continue
+                addresses = [entry.get("address")]
+                addresses.extend((entry.get("coin_types") or {}).values())
+                wallets = list(dict.fromkeys(
+                    str(address).lower()
+                    for address in addresses
+                    if address and is_eth_address(str(address)) and is_real_wallet(str(address))
+                ))
+                if wallets:
+                    texts = entry.get("text_records") or {}
+                    return {
+                        "found": True, "platform": "NameStone", "emoji": "🪨",
+                        "url": f"https://app.ens.domains/{name}", "matched": name,
+                        "wallets": wallets,
+                        "extra": {
+                            "domain": name,
+                            "twitter": texts.get("com.twitter") or texts.get("twitter"),
+                            "source": "namestone_api",
+                        },
+                    }
         except Exception:
-            log.debug("ens web3bio fallback failed name=%s", name, exc_info=True)
-
-    return {"found": False, "platform": "ENS (.eth)", "emoji": "🔷"}
+            log.debug("namestone lookup failed name=%s", name, exc_info=True)
+    return {"found": False, "platform": "NameStone", "emoji": "🪨"}
 
 
 PLATFORMS = [
@@ -999,12 +1817,14 @@ PLATFORMS = [
     check_farcaster,
     check_ens,
     check_web3bio,
+    check_clusters,
     check_lens,
     # Tier 2 — средние
     check_sns,
     check_unstoppable,
     check_spaceid,
     check_basename,       # новый — Base Names
+    check_namestone,
     # Tier 3 — нишевые но полезные
     check_github,
     check_gitcoin,
@@ -1016,10 +1836,12 @@ PLATFORMS = [
 BULK_PLATFORMS = [
     check_ens,
     check_web3bio,
+    check_clusters,
     check_farcaster,
     check_lens,
     check_sns,
     check_basename,
+    check_namestone,
     check_opensea_v2,
 ]
 
@@ -1211,7 +2033,14 @@ def _attach_source_diagnostics(result: dict, tracked: _TrackedClient) -> dict:
     return result
 
 
-async def _run_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
+async def _run_platform(
+    fn,
+    client,
+    username: str,
+    variants: dict,
+    platform_timeout: int | None = None,
+    retried: bool = False,
+) -> dict:
     started = time.perf_counter()
     timeout = platform_timeout or PLATFORM_TIMEOUT_SECONDS
     tracked = _TrackedClient(client)
@@ -1222,12 +2051,22 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
         )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         cleaned = _clean_result(result, username, elapsed_ms)
-        if not cleaned.get("found") and tracked.unavailable:
-            cleaned["error"] = "source_unavailable"
+        cleaned["source_id"] = fn.__name__
+        if not cleaned.get("found") and tracked.circuit_open_count:
+            cleaned["error"] = "circuit_open"
+        elif (not cleaned.get("found") and tracked.had_temporary_failure
+              and not cleaned.get("source_available")):
+            cleaned["error"] = (
+                "source_unavailable" if tracked.unavailable else "source_partial"
+            )
         if not cleaned.get("found"):
             cached_hit = _get_platform_hit(fn.__name__, username, variants)
             if cached_hit:
                 cached_hit["elapsed_ms"] = elapsed_ms
+                cached_hit["source_id"] = fn.__name__
+                record_platform_result(
+                    fn.__name__, found=True, error=None, elapsed_ms=elapsed_ms, retried=True
+                )
                 return _attach_source_diagnostics(cached_hit, tracked)
         if cleaned.get("found"):
             _remember_platform_hit(fn.__name__, username, variants, cleaned)
@@ -1238,6 +2077,13 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
                 len(cleaned.get("wallets") or []),
                 elapsed_ms,
             )
+        record_platform_result(
+            fn.__name__,
+            found=bool(cleaned.get("found")),
+            error=cleaned.get("error"),
+            elapsed_ms=elapsed_ms,
+            retried=retried,
+        )
         return _attach_source_diagnostics(cleaned, tracked)
     except asyncio.TimeoutError:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1247,6 +2093,10 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
             username,
             elapsed_ms,
             "timeout",
+        )
+        result["source_id"] = fn.__name__
+        record_platform_result(
+            fn.__name__, found=False, error="timeout", elapsed_ms=elapsed_ms, retried=retried
         )
         return _attach_source_diagnostics(result, tracked)
     except Exception as exc:
@@ -1258,10 +2108,21 @@ async def _run_platform(fn, client, username: str, variants: dict, platform_time
             elapsed_ms,
             str(exc)[:120],
         )
+        result["source_id"] = fn.__name__
+        record_platform_result(
+            fn.__name__, found=False, error=str(exc)[:120], elapsed_ms=elapsed_ms, retried=retried
+        )
         return _attach_source_diagnostics(result, tracked)
 
 
-async def _run_bulk_platform(fn, client, username: str, variants: dict, platform_timeout: int | None = None) -> dict:
+async def _run_bulk_platform(
+    fn,
+    client,
+    username: str,
+    variants: dict,
+    platform_timeout: int | None = None,
+    retried: bool = False,
+) -> dict:
     semaphore = _BULK_PLATFORM_SEMAPHORES[fn.__name__]
     timeout = platform_timeout
     if timeout is None:
@@ -1277,6 +2138,7 @@ async def _run_bulk_platform(fn, client, username: str, variants: dict, platform
             username,
             variants,
             platform_timeout=timeout,
+            retried=retried,
         )
 
 
@@ -1393,6 +2255,7 @@ async def run_bulk_search(username: str) -> dict:
     variants = get_variants(username)
     dotted_domain = username.strip().lower().replace("_", ".")
     if any(dotted_domain.endswith(suffix) for suffix in DOMAIN_SUFFIXES):
+        variants["explicit_domain"] = dotted_domain
         variants["base"] = list(dict.fromkeys(
             [dotted_domain] + variants["base"]
         ))
@@ -1419,6 +2282,7 @@ async def run_bulk_search(username: str) -> dict:
                 username,
                 variants,
                 platform_timeout=BULK_ENS_RETRY_TIMEOUT_SECONDS,
+                retried=True,
             )
             if ens_retry.get("wallets") or not ens_retry.get("error"):
                 results[ens_index] = ens_retry
@@ -1426,12 +2290,85 @@ async def run_bulk_search(username: str) -> dict:
     data = _build_search_response(username, variants, results, started)
     data["bulk_mode"] = True
     data["bulk_complete"] = not any(result.get("error") for result in results)
+    data["partial_sources"] = list(dict.fromkeys(
+        str(result.get("source_id") or "")
+        for result in results
+        if result.get("error") and result.get("source_id")
+    ))
     data["diagnostics"]["ens_retried"] = bool(
         ens_result.get("error") and not ens_result.get("wallets")
     )
     if data["all_wallets"] and data["bulk_complete"]:
         _set_bulk_cached(username, data)
     return data
+
+
+async def retry_bulk_search(username: str, previous_data: dict) -> dict:
+    """Retry only failed bulk sources and merge them into the previous result."""
+    source_ids = list(previous_data.get("partial_sources") or [])
+    if not source_ids:
+        source_ids = [
+            str(result.get("source_id") or "")
+            for result in previous_data.get("results") or []
+            if result.get("error") and result.get("source_id")
+        ]
+    platform_map = {fn.__name__: fn for fn in BULK_PLATFORMS}
+    retry_fns = [platform_map[source_id] for source_id in source_ids if source_id in platform_map]
+    if not retry_fns:
+        retry_fns = list(BULK_PLATFORMS)
+        source_ids = [fn.__name__ for fn in retry_fns]
+
+    variants = get_variants(username)
+    dotted_domain = username.strip().lower().replace("_", ".")
+    if any(dotted_domain.endswith(suffix) for suffix in DOMAIN_SUFFIXES):
+        variants["explicit_domain"] = dotted_domain
+        variants["base"] = list(dict.fromkeys([dotted_domain] + variants["base"]))
+        variants["domains"] = list(dict.fromkeys([dotted_domain] + variants["domains"]))
+
+    started = time.perf_counter()
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=BULK_USERNAME_TIMEOUT_SECONDS,
+    ) as client:
+        retried_results = await asyncio.gather(*[
+            _run_bulk_platform(fn, client, username, variants, retried=True)
+            for fn in retry_fns
+        ])
+
+    replacements = {
+        str(result.get("source_id") or ""): result
+        for result in retried_results
+        if result.get("source_id")
+    }
+    merged_results = []
+    used = set()
+    for old_result in previous_data.get("results") or []:
+        source_id = str(old_result.get("source_id") or "")
+        if source_id in replacements:
+            merged_results.append(replacements[source_id])
+            used.add(source_id)
+        else:
+            merged_results.append(copy.deepcopy(old_result))
+    for source_id, result in replacements.items():
+        if source_id not in used:
+            merged_results.append(result)
+
+    merged = _build_search_response(username, variants, merged_results, started)
+    merged["bulk_mode"] = True
+    merged["bulk_complete"] = not any(result.get("error") for result in merged_results)
+    merged["partial_sources"] = list(dict.fromkeys(
+        str(result.get("source_id") or "")
+        for result in merged_results
+        if result.get("error") and result.get("source_id")
+    ))
+    merged["diagnostics"]["retry_sources"] = source_ids
+    merged["diagnostics"]["retry_count"] = int(
+        (previous_data.get("diagnostics") or {}).get("retry_count", 0)
+    ) + 1
+    if merged["all_wallets"] and merged["bulk_complete"]:
+        _set_bulk_cached(username, merged)
+    return merged
 
 
 # ─── GoldRush: баланс кошелька в USD ──────────────────────────────────────────

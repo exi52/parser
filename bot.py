@@ -10,6 +10,7 @@ from telegram.constants import ParseMode
 
 from searcher import extract_username, run_search, reverse_lookup, is_eth_address, get_variants, enrich_balances
 from database import consume_rate_limit, init_db, close_pool, get_pool
+from source_health import flush_source_metrics, get_source_stats
 from access  import (
     get_or_create_user, check_access, use_search, get_user_stats,
     activate_ref, get_referrals, list_all_refs,
@@ -1011,7 +1012,7 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_main())
     except Exception:
-        pass
+        log.debug("Could not notify confirmed user %s", user_id, exc_info=True)
 
 
 async def cmd_adminstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1044,6 +1045,48 @@ async def cmd_adminstats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"<b>{money(stats.get('sub_revenue_total'))}</b>\n"
         f"Bulk месяц/все время: <b>{money(stats.get('bulk_revenue_month'))}</b> / "
         f"<b>{money(stats.get('bulk_revenue_total'))}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_sourcestats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Source hit rate, failures, latency and circuit state: /sourcestats [hours]."""
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        hours = int(ctx.args[0]) if ctx.args else 24
+    except ValueError:
+        await update.message.reply_text("Формат: /sourcestats [HOURS]")
+        return
+    hours = max(1, min(hours, 720))
+    rows = await get_source_stats(hours)
+    if not rows:
+        await update.message.reply_text("Статистика источников пока пуста.")
+        return
+
+    lines = [f"<b>Source health · {hours}h</b>"]
+    for row in rows[:20]:
+        checks = int(row.get("checks") or 0)
+        requests = int(row.get("requests") or 0)
+        hits = int(row.get("hits") or 0)
+        denominator = checks or requests
+        hit_rate = round(hits * 100 / checks, 1) if checks else 0
+        failures = (
+            int(row.get("http_429") or 0)
+            + int(row.get("http_5xx") or 0)
+            + int(row.get("timeouts") or 0)
+            + int(row.get("network_errors") or 0)
+        )
+        circuit = row.get("circuit_state") or "closed"
+        lines.append(
+            f"\n<code>{esc(row.get('source') or 'unknown')}</code> · <b>{esc(circuit)}</b>\n"
+            f"{denominator} checks · {hits} hits ({hit_rate}%) · {row.get('avg_latency_ms', 0)} ms\n"
+            f"429: {int(row.get('http_429') or 0)} · 5xx: {int(row.get('http_5xx') or 0)} · "
+            f"timeout: {int(row.get('timeouts') or 0)} · errors: {failures} · "
+            f"circuit skips: {int(row.get('circuit_skips') or 0)}"
+        )
+    await update.message.reply_text(
+        "".join(lines)[:4000],
         parse_mode=ParseMode.HTML,
     )
 
@@ -1225,7 +1268,7 @@ async def cmd_confirmbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=kb_bulk_web())
     except Exception:
-        pass
+        log.debug("Could not notify confirmed bulk user %s", user_id, exc_info=True)
 
 
 async def cmd_grantbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1252,7 +1295,7 @@ async def cmd_grantbulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Запуск bulk теперь доступен через Web App.",
             parse_mode=ParseMode.HTML, reply_markup=kb_bulk_web())
     except Exception:
-        pass
+        log.debug("Could not notify bulk grant user %s", user_id, exc_info=True)
 
 
 async def cmd_revokebulk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1327,6 +1370,7 @@ def main():
         await init_db()
 
     async def post_shutdown(app):
+        await flush_source_metrics()
         await close_pool()
 
     app = (
@@ -1339,6 +1383,7 @@ def main():
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_start))
     app.add_handler(CommandHandler("adminstats", cmd_adminstats))
+    app.add_handler(CommandHandler("sourcestats", cmd_sourcestats))
     app.add_handler(CommandHandler("confirm", cmd_confirm))
     app.add_handler(CommandHandler("grant",   cmd_grant))
     app.add_handler(CommandHandler("granttrial", cmd_granttrial))

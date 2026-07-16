@@ -5,7 +5,6 @@ Run:
     uvicorn miniapp:app --host 0.0.0.0 --port 8000
 """
 
-import asyncio
 import hashlib
 import hmac
 import json
@@ -15,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qsl
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -23,15 +22,22 @@ from fastapi.staticfiles import StaticFiles
 from access import check_bulk_access, get_bulk_status, get_or_create_user
 from bulk_service import (
     MAX_BULK_LINES,
+    cancel_bulk_job,
     create_bulk_job,
     export_job_csv,
     get_active_job_for_user,
+    get_job,
     list_job_items,
     list_jobs,
     parse_bulk_usernames,
-    process_bulk_job,
+    pause_bulk_job,
+    resume_bulk_job,
+    schedule_bulk_job,
+    start_bulk_scheduler,
+    stop_bulk_scheduler,
 )
-from database import consume_rate_limit, get_pool, init_db
+from database import consume_rate_limit, init_db
+from source_health import flush_source_metrics, get_source_stats
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MINIAPP_DEV_USER_ID = os.getenv("MINIAPP_DEV_USER_ID", "")
@@ -60,17 +66,13 @@ app = FastAPI(title="Crypto OSINT Bulk Mini App")
 @app.on_event("startup")
 async def startup():
     await init_db()
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id
-            FROM bulk_jobs
-            WHERE status IN ('queued', 'running')
-            ORDER BY created_at ASC
-            LIMIT 5
-        """)
-    for row in rows:
-        asyncio.create_task(process_bulk_job(row["id"]))
+    start_bulk_scheduler()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await stop_bulk_scheduler()
+    await flush_source_metrics()
 
 
 def _loads_json(value):
@@ -180,9 +182,17 @@ async def api_jobs(user=Depends(current_user)):
     return {"jobs": _clean(await list_jobs(user["id"]))}
 
 
+@app.get("/api/admin/source-stats")
+async def api_source_stats(hours: int = 24, user=Depends(current_user)):
+    if user["id"] not in ADMIN_IDS:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    await check_rate_limit(user["id"], "source_stats", 30)
+    hours = max(1, min(hours, 720))
+    return {"hours": hours, "sources": _clean(await get_source_stats(hours))}
+
+
 @app.post("/api/jobs")
 async def api_create_job(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     user=Depends(current_user),
 ):
@@ -222,7 +232,7 @@ async def api_create_job(
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    background_tasks.add_task(process_bulk_job, job["id"])
+    schedule_bulk_job(job["id"])
     return {
         "job": _clean(job),
         "parsed": {
@@ -231,6 +241,44 @@ async def api_create_job(
             "truncated": len(usernames) >= MAX_BULK_LINES and total_lines > MAX_BULK_LINES,
         },
     }
+
+
+async def _job_action(user_id: int, job_id: int, action: str):
+    handlers = {
+        "pause": pause_bulk_job,
+        "resume": resume_bulk_job,
+        "cancel": cancel_bulk_job,
+    }
+    result = await handlers[action](user_id, job_id)
+    if result:
+        if action == "resume":
+            schedule_bulk_job(job_id)
+        return {"job": _clean(result)}
+    existing = await get_job(user_id, job_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Job not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Cannot {action} job with status {existing['status']}",
+    )
+
+
+@app.post("/api/jobs/{job_id}/pause")
+async def api_pause_job(job_id: int, user=Depends(current_user)):
+    await check_rate_limit(user["id"], "job_action", 30)
+    return await _job_action(user["id"], job_id, "pause")
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def api_resume_job(job_id: int, user=Depends(current_user)):
+    await check_rate_limit(user["id"], "job_action", 30)
+    return await _job_action(user["id"], job_id, "resume")
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_cancel_job(job_id: int, user=Depends(current_user)):
+    await check_rate_limit(user["id"], "job_action", 30)
+    return await _job_action(user["id"], job_id, "cancel")
 
 
 @app.get("/api/jobs/{job_id}")
@@ -271,7 +319,7 @@ async def api_job_items(
     items = []
     for row in data["items"]:
         item = dict(row)
-        for key in ("wallets", "platforms", "matched", "balances"):
+        for key in ("wallets", "platforms", "matched", "balances", "partial_sources"):
             item[key] = _loads_json(item.get(key))
         items.append(item)
     return {
