@@ -1380,6 +1380,10 @@ async def check_basename(client, username, variants):
 
     prefetched = await _get_web3bio_prefetch(username)
     if prefetched is not None:
+        batch_checked = any(
+            str(query_id).startswith("basenames,")
+            for query_id in prefetched.get("query_ids") or []
+        )
         profiles = [
             profile
             for profile in prefetched.get("profiles") or []
